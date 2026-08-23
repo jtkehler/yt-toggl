@@ -1,0 +1,12 @@
+{
+  "name": "yt-toggl-userscript",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dependency-free YouTube watch-time tracking userscript for Toggl Track",
+  "scripts": {
+    "test": "node test/yt-toggl.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
