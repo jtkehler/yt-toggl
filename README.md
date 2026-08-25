@@ -23,7 +23,7 @@ It supports ordinary desktop videos, live streams, and Shorts. Consecutive video
    ```
 
 4. Set `togglApiToken` to the API token from your Toggl Track profile and `togglWorkspaceId` to the numeric destination workspace. Set `togglProjectId` to a numeric project ID or leave it as `null`.
-5. Save the script and reload an open YouTube page. Expand the **YT → Toggl** control in the lower-right corner; configuration errors appear there without stopping local tracking.
+5. Save the script and reload an open YouTube page. Open the stopwatch button in the YouTube masthead, left of **Create**; configuration errors appear in its panel without stopping local tracking.
 
 Treat the API token like a password. Do not commit or share a configured copy of the userscript.
 
@@ -47,7 +47,7 @@ function makeDescription(channel) {
 | `mergeBelowMinimum` | `true` carries short sessions forward within the same logical tab; `false` permanently discards each short session. |
 | `maxRequestsPerHour` | Local rolling-hour attempt cap. The default matches Toggl's documented free-workspace quota. |
 
-Changing `mergeBelowMinimum` to `false` does not silently delete carry that already exists. Expand the status control and use **Discard current carry** if that is what you want.
+Changing `mergeBelowMinimum` to `false` does not silently delete carry that already exists. Open the status panel and use **Discard current carry** if that is what you want.
 
 ## What counts as watch time
 
@@ -79,7 +79,11 @@ Because earlier carry is added to the receiving session's duration, the entry's 
 
 ## Status, Sync, and recovery
 
-The lower-right Shadow-DOM control appears only in the top-level YouTube page, not embedded frames such as live chat. It shows current-tab time, current-tab carry, all finalized queue items, and errors or entries that need a decision.
+The Shadow-DOM control appears only in the top-level YouTube page, not embedded frames such as live chat. Its button sits in the YouTube masthead, ahead of **Create**; if the masthead is unavailable the button falls back to the lower-right corner of the page. Because the masthead is hidden in fullscreen, the panel is reachable only outside fullscreen.
+
+The button itself reports state, never time. It takes an accent ring while a session is open, and pulses only while playback is actually earning credit; a pause, a stall, a seek, ended media, or an ad break holds the session open but stops the pulse, and the panel reads **TRACKING PAUSED** rather than **NOW TRACKING**. A dot appears when something needs a decision: a configuration error, a queue entry to retry or dismiss, or stale carry from a closed tab waiting to be attached or discarded.
+
+Opening the panel shows the current session, the channel, and how long remains until the session passes `minimumDurationMinutes` and counts as kept rather than carried, along with current-tab carry, all finalized queue items, and errors or entries that need a decision. When `mergeBelowMinimum` is `true`, existing carry is measured against that minimum together with the current session, because they are finalized as one entry.
 
 **Sync all tabs** broadcasts through Violentmonkey storage. Every open YouTube tab independently finalizes its current session under the same minimum rule. A player that is still eligible immediately starts a fresh zero-length session. Below-minimum carry remains local and visible.
 
@@ -106,7 +110,7 @@ The worker sends exactly one `POST /api/v9/workspaces/{workspace_id}/time_entrie
 
 Known quota and rate-limit rejections remain pending for later delivery. Authentication and other non-retryable 4xx responses are marked **Blocked** so they do not burn the request allowance repeatedly.
 
-Timeouts, network failures after dispatch, interrupted in-flight requests, and 5xx responses are **Uncertain**: Toggl's create endpoint has no idempotency key, so an automatic retry could duplicate an entry that was actually created. Check Toggl first, then explicitly choose **Retry** or **Dismiss** in the status control.
+Timeouts, network failures after dispatch, interrupted in-flight requests, and 5xx responses are **Uncertain**: Toggl's create endpoint has no idempotency key, so an automatic retry could duplicate an entry that was actually created. Check Toggl first, then explicitly choose **Retry** or **Dismiss** in the status panel.
 
 If every YouTube tab is closed, nothing can upload in the background. Saved sessions and queue items are recovered the next time a YouTube page runs the userscript.
 
@@ -125,4 +129,4 @@ Node 18 or newer is sufficient; there are no packages to install.
 npm test
 ```
 
-The tests exercise session boundaries, suspension and clock corrections, crash-safe and unreadable carry transfer, carry/discard behavior, tab isolation and cleanup, route/player navigation races, playback speed, seeks, stalls, ads, live/Shorts behavior, collapsed status rendering, global Sync, reload and stale-session recovery, request spacing and quota exhaustion, request payloads, authentication failures, and uncertain POST outcomes. They do not contact YouTube or Toggl.
+The tests exercise session boundaries, suspension and clock corrections, crash-safe and unreadable carry transfer, carry/discard behavior, tab isolation and cleanup, route/player navigation races, playback speed, seeks, stalls, ads, live/Shorts behavior, collapsed status rendering, playback-eligibility and stale-carry signalling, masthead mounting and re-injection, panel dismissal, global Sync, reload and stale-session recovery, request spacing and quota exhaustion, request payloads, authentication failures, and uncertain POST outcomes. They do not contact YouTube or Toggl.

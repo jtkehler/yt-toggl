@@ -1519,57 +1519,233 @@ function makeDescription(channel) {
       : `${minutes}:${String(seconds).padStart(2, "0")}`;
   }
 
+  const SVG_NS = "http://www.w3.org/2000/svg";
+
+  // YouTube rebuilds its masthead across sign-in and layout changes, so the
+  // button is placed by selector on every render rather than mounted once.
+  const MASTHEAD_SLOTS = [
+    "ytd-masthead #end #buttons",
+    "ytd-masthead #buttons",
+    "#masthead #end #buttons",
+    "ytd-masthead #end",
+    "#masthead-container #end",
+  ];
+
+  const PALETTE = `
+    --ink: #0c0b0e;
+    --surface: #17151b;
+    --raised: #201c28;
+    --line: #2a2632;
+    --edge: #3a3446;
+    --text: #edeaf2;
+    --muted: #948ea3;
+    --accent: #e57cd8;
+    --warn: #f2a65a;
+    --danger: #ff6b5e;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Ubuntu, Cantarell, Helvetica, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  `;
+
+  const BUTTON_CSS = `
+    :host { all: initial; ${PALETTE} --icon: #f1f1f1;
+      display: inline-flex; align-items: center; flex: 0 0 auto; }
+    :host([data-theme="light"]) { --icon: #0f0f0f; }
+    * { box-sizing: border-box; }
+    #summary { position: relative; display: inline-flex; align-items: center; justify-content: center;
+      width: 40px; height: 40px; padding: 0; border: 0; border-radius: 50%;
+      background: transparent; color: var(--icon); cursor: pointer;
+      -webkit-tap-highlight-color: transparent; }
+    #summary:hover { background: rgba(255,255,255,0.1); }
+    :host([data-theme="light"]) #summary:hover { background: rgba(0,0,0,0.06); }
+    #summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    :host([data-placement="floating"]) #summary { position: fixed; right: 16px; bottom: 16px;
+      z-index: 2147483646; background: var(--ink); color: var(--text);
+      border: 1px solid var(--line); box-shadow: 0 2px 14px #0009; }
+    :host([data-placement="floating"]) #summary:hover { background: var(--raised); }
+    #icon { display: block; width: 24px; height: 24px; }
+    #ring, #stem { fill: none; stroke: currentColor; stroke-width: 1.7;
+      stroke-linecap: round; stroke-linejoin: round; }
+    #play { fill: currentColor; }
+    #summary[data-state="tracking"] #ring,
+    #summary[data-state="tracking"] #stem,
+    #summary[data-state="paused"] #ring,
+    #summary[data-state="paused"] #stem { stroke: var(--accent); }
+    /* A held session keeps the accent so the open session stays visible, but
+       only accruing playback breathes. */
+    #summary[data-state="paused"] #play { fill: var(--muted); }
+    #summary[data-state="tracking"] #icon { animation: breathe 2.4s ease-in-out infinite; }
+    @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    #attention { position: absolute; top: 6px; right: 6px; width: 7px; height: 7px;
+      border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 2px var(--ink); }
+    :host([data-theme="light"]) #attention { box-shadow: 0 0 0 2px #fff; }
+    #summary[data-attention="0"] #attention { display: none; }
+    @media (prefers-reduced-motion: reduce) {
+      #summary[data-state="tracking"] #icon { animation: none; }
+    }
+  `;
+
+  const PANEL_CSS = `
+    :host { all: initial; ${PALETTE} }
+    * { box-sizing: border-box; }
+    #panel { position: fixed; z-index: 2147483647; top: 64px; right: 16px;
+      width: min(360px, calc(100vw - 24px)); max-height: min(72vh, 640px); overflow: auto;
+      padding: 16px 16px 15px; border: 1px solid var(--line); border-radius: 12px;
+      background: var(--ink); color: var(--text); font: 13px/1.45 var(--sans);
+      box-shadow: 0 18px 48px #000b, 0 2px 8px #0007;
+      scrollbar-width: thin; scrollbar-color: var(--edge) transparent;
+      animation: rise 140ms cubic-bezier(0.2, 0.7, 0.3, 1); }
+    #panel::-webkit-scrollbar { width: 8px; }
+    #panel::-webkit-scrollbar-thumb { border-radius: 4px; background: var(--edge); }
+    #panel::-webkit-scrollbar-track { background: transparent; }
+    #panel[hidden] { display: none; }
+    #panel:focus { outline: none; }
+    @keyframes rise { from { opacity: 0; transform: translateY(-4px); } }
+    .eyebrow { margin: 0; font: 10px/1 var(--mono); letter-spacing: 0.12em;
+      text-transform: uppercase; color: var(--muted); }
+    #readout { margin: 9px 0 3px; font: 30px/1 var(--mono); letter-spacing: -0.01em;
+      font-variant-numeric: tabular-nums; }
+    #channel { margin: 0; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+    #threshold-group[hidden] { display: none; }
+    #threshold { height: 2px; margin: 14px 0 8px; border-radius: 2px;
+      background: var(--line); overflow: hidden; }
+    #threshold-fill { display: block; width: 0%; height: 100%; background: var(--muted);
+      transition: width 240ms linear; }
+    #threshold[data-state="met"] #threshold-fill { background: var(--accent); }
+    #threshold-caption { margin: 0; font: 10px/1 var(--mono); letter-spacing: 0.12em;
+      text-transform: uppercase; color: var(--muted); }
+    #threshold[data-state="met"] + #threshold-caption { color: var(--accent); }
+    .rows { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px;
+      margin: 18px 0 0; }
+    .rows dt { font: 10px/1.6 var(--mono); letter-spacing: 0.12em;
+      text-transform: uppercase; color: var(--muted); }
+    .rows dd { margin: 0; text-align: right; font: 12.5px/1.6 var(--mono);
+      font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    h3 { margin: 17px 0 0; font: 10px/1 var(--mono); letter-spacing: 0.12em;
+      text-transform: uppercase; color: var(--muted); }
+    button { font: 11px/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase;
+      padding: 9px 11px; border: 1px solid var(--line); border-radius: 7px;
+      background: var(--surface); color: var(--text); cursor: pointer; }
+    button:hover:not(:disabled) { background: var(--raised); border-color: var(--edge); }
+    button:disabled { opacity: 0.45; cursor: default; }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    button.danger { color: var(--danger); }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
+    .item .actions { margin-top: 10px; }
+    .notice, .item { margin-top: 9px; padding: 10px 11px; border: 1px solid var(--line);
+      border-left: 2px solid var(--warn); border-radius: 8px; background: var(--surface); }
+    .item p, .notice p { margin: 0 0 7px; overflow-wrap: anywhere; }
+    .item p:last-child, .notice p:last-child { margin-bottom: 0; }
+    .meta { color: var(--muted); font-size: 12px; }
+    @media (prefers-reduced-motion: reduce) {
+      #panel { animation: none; }
+      #threshold-fill { transition: none; }
+    }
+  `;
+
+  // render() runs every tick, and the button host lives inside YouTube's own
+  // masthead, so only write attributes that actually changed.
+  function setDataValue(element, name, value) {
+    if (element.dataset[name] !== value) element.dataset[name] = value;
+  }
+
+  function setAttributeValue(element, name, value) {
+    if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+  }
+
+  // A stopwatch ring with playback inside it: the two things this script joins.
+  function createStatusIcon() {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("id", "icon");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    const ring = document.createElementNS(SVG_NS, "circle");
+    ring.setAttribute("id", "ring");
+    ring.setAttribute("cx", "12");
+    ring.setAttribute("cy", "13.2");
+    ring.setAttribute("r", "8.1");
+    const stem = document.createElementNS(SVG_NS, "path");
+    stem.setAttribute("id", "stem");
+    stem.setAttribute("d", "M9.9 2.6h4.2M12 2.6v2.5");
+    const play = document.createElementNS(SVG_NS, "path");
+    play.setAttribute("id", "play");
+    play.setAttribute("d", "M9.9 9.6 15.1 13.2 9.9 16.8Z");
+    svg.append(ring, stem, play);
+    return svg;
+  }
+
   class StatusControl {
     constructor(app) {
       this.app = app;
       this.expanded = false;
+      // YouTube enforces Trusted Types in the page realm, so build both shells
+      // without an HTML-parsing sink such as ShadowRoot.innerHTML.
+      this.buttonHost = document.createElement("div");
+      this.buttonHost.id = "yt-toggl-button-host";
+      this.buttonHost.dataset.placement = "floating";
+      this.buttonShadow = this.buttonHost.attachShadow({ mode: "open" });
+
+      const buttonStyle = document.createElement("style");
+      buttonStyle.textContent = BUTTON_CSS;
+      const summary = document.createElement("button");
+      summary.id = "summary";
+      summary.type = "button";
+      summary.dataset.state = "idle";
+      summary.dataset.attention = "0";
+      summary.setAttribute("aria-expanded", "false");
+      summary.setAttribute("aria-haspopup", "dialog");
+      summary.setAttribute("aria-label", "YouTube watch time");
+      summary.setAttribute("title", "YouTube watch time");
+      const attention = document.createElement("span");
+      attention.id = "attention";
+      summary.append(createStatusIcon(), attention);
+      this.buttonShadow.append(buttonStyle, summary);
+
+      // The panel lives on the body: YouTube translates the masthead to hide it,
+      // and a transformed ancestor would become the containing block for a
+      // fixed-position child and drag the panel out of the viewport.
       this.host = document.createElement("div");
       this.host.id = "yt-toggl-status-host";
       this.shadow = this.host.attachShadow({ mode: "open" });
-      // YouTube enforces Trusted Types in the page realm, so build the static
-      // shell without an HTML-parsing sink such as ShadowRoot.innerHTML.
-      const style = document.createElement("style");
-      style.textContent = `
-        :host { all: initial; }
-        * { box-sizing: border-box; }
-        .wrap { position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
-          color: #f4f4f4; font: 13px/1.35 system-ui, sans-serif; }
-        button { border: 1px solid #545454; border-radius: 7px; background: #252525; color: inherit;
-          padding: 7px 10px; cursor: pointer; font: inherit; }
-        button:hover { background: #343434; }
-        button:disabled { cursor: default; opacity: 0.55; }
-        button.danger { color: #ffaaaa; }
-        #summary { display: block; margin-left: auto; border-radius: 999px; background: #171717;
-          box-shadow: 0 2px 12px #0008; }
-        #summary[data-state="issue"] { border-color: #d9822b; }
-        #summary[data-state="active"] { border-color: #42b983; }
-        #panel { width: min(390px, calc(100vw - 32px)); max-height: min(620px, calc(100vh - 80px));
-          overflow: auto; margin-bottom: 8px; padding: 14px; border: 1px solid #4a4a4a; border-radius: 10px;
-          background: #171717; box-shadow: 0 6px 24px #000a; }
-        #panel[hidden] { display: none; }
-        h2 { margin: 0 0 10px; font-size: 15px; }
-        h3 { margin: 14px 0 6px; font-size: 13px; color: #cfcfcf; }
-        dl { display: grid; grid-template-columns: auto 1fr; gap: 5px 12px; margin: 0; }
-        dt { color: #aaa; } dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
-        .actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
-        .notice { margin-top: 10px; padding: 8px; border-radius: 6px; background: #372817; color: #ffd8a8; }
-        .item { margin-top: 7px; padding-top: 7px; border-top: 1px solid #383838; }
-        .item p { margin: 0 0 6px; overflow-wrap: anywhere; }
-        .item .meta { color: #aaa; font-size: 12px; }
-        .empty { color: #888; }
-      `;
 
-      const wrap = document.createElement("div");
-      wrap.className = "wrap";
+      const panelStyle = document.createElement("style");
+      panelStyle.textContent = PANEL_CSS;
 
       const panel = document.createElement("section");
       panel.id = "panel";
       panel.hidden = true;
+      panel.tabIndex = -1;
+      panel.setAttribute("role", "dialog");
+      panel.setAttribute("aria-label", "YouTube watch time");
 
-      const heading = document.createElement("h2");
-      heading.textContent = "YouTube → Toggl";
+      const eyebrow = document.createElement("p");
+      eyebrow.id = "eyebrow";
+      eyebrow.className = "eyebrow";
+      eyebrow.textContent = "NOT TRACKING";
+      const readout = document.createElement("p");
+      readout.id = "readout";
+      readout.textContent = "0:00";
+      const channelLine = document.createElement("p");
+      channelLine.id = "channel";
+      channelLine.textContent = "Nothing playing";
+
+      // The minimum-duration boundary decides whether this session is kept or
+      // carried, so it is the one thing the panel draws rather than states.
+      const thresholdGroup = document.createElement("div");
+      thresholdGroup.id = "threshold-group";
+      thresholdGroup.hidden = true;
+      const threshold = document.createElement("div");
+      threshold.id = "threshold";
+      threshold.dataset.state = "below";
+      const thresholdFill = document.createElement("span");
+      thresholdFill.id = "threshold-fill";
+      threshold.appendChild(thresholdFill);
+      const thresholdCaption = document.createElement("p");
+      thresholdCaption.id = "threshold-caption";
+      thresholdGroup.append(threshold, thresholdCaption);
 
       const details = document.createElement("dl");
+      details.className = "rows";
       const appendDetail = (label, id, value) => {
         const term = document.createElement("dt");
         term.textContent = label;
@@ -1578,10 +1754,8 @@ function makeDescription(channel) {
         description.textContent = value;
         details.append(term, description);
       };
-      appendDetail("Current tab", "current", "0:00");
-      appendDetail("Carried short", "carry", "0:00");
-      appendDetail("Finalized queue", "queue", "0");
-      appendDetail("Errors / decisions", "issues", "0");
+      appendDetail("Carried", "carry", "0:00");
+      appendDetail("Queue", "queue", "0");
 
       const configBox = document.createElement("div");
       configBox.id = "config";
@@ -1606,31 +1780,113 @@ function makeDescription(channel) {
       decisionBox.id = "decisions";
       const errorBox = document.createElement("div");
       errorBox.id = "errors";
-      panel.append(heading, details, configBox, actions, orphanBox, decisionBox, errorBox);
-
-      const summary = document.createElement("button");
-      summary.id = "summary";
-      summary.type = "button";
-      summary.setAttribute("aria-expanded", "false");
-      summary.textContent = "YT → Toggl 0:00";
-      wrap.append(panel, summary);
-      this.shadow.append(style, wrap);
+      panel.append(
+        eyebrow,
+        readout,
+        channelLine,
+        thresholdGroup,
+        details,
+        configBox,
+        actions,
+        orphanBox,
+        decisionBox,
+        errorBox,
+      );
+      this.shadow.append(panelStyle, panel);
 
       this.panel = panel;
       this.summary = summary;
-      this.summary.addEventListener("click", () => {
-        this.expanded = !this.expanded;
-        this.panel.hidden = !this.expanded;
-        this.summary.setAttribute("aria-expanded", String(this.expanded));
-        this.render();
-      });
+      this.summary.addEventListener("click", () => this.toggle());
       sync.addEventListener("click", () => this.app.broadcastSync());
       discardCurrent.addEventListener("click", () => this.app.discardCurrentCarry());
+
+      document.addEventListener(
+        "keydown",
+        (event) => {
+          if (this.expanded && event && event.key === "Escape") this.toggle(false);
+        },
+        true,
+      );
+      document.addEventListener(
+        "click",
+        (event) => {
+          if (!this.expanded || !event) return;
+          const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+          if (path.includes(this.host) || path.includes(this.buttonHost)) return;
+          this.toggle(false);
+        },
+        true,
+      );
     }
 
     mount() {
       (document.body || document.documentElement).appendChild(this.host);
+      this.placeButton();
       this.render();
+    }
+
+    findMastheadSlot() {
+      for (const selector of MASTHEAD_SLOTS) {
+        const slot = document.querySelector(selector);
+        if (slot) return slot;
+      }
+      return null;
+    }
+
+    placeButton() {
+      // Steady state: already seated in the masthead, so skip the selector scan.
+      // A masthead rebuild detaches the host, which clears isConnected.
+      if (this.buttonHost.isConnected && this.buttonHost.dataset.placement === "masthead") return;
+      const slot = this.findMastheadSlot();
+      if (slot) {
+        if (this.buttonHost.parentNode === slot) return;
+        this.buttonHost.dataset.placement = "masthead";
+        slot.prepend(this.buttonHost);
+        return;
+      }
+      if (this.buttonHost.isConnected) return;
+      this.buttonHost.dataset.placement = "floating";
+      (document.body || document.documentElement).appendChild(this.buttonHost);
+    }
+
+    syncTheme() {
+      const root = document.documentElement;
+      const dark = !root || typeof root.hasAttribute !== "function" || root.hasAttribute("dark");
+      setDataValue(this.buttonHost, "theme", dark ? "dark" : "light");
+    }
+
+    positionPanel() {
+      if (this.buttonHost.dataset.placement !== "masthead") {
+        // Both offsets must be explicit: leaving `top` to the stylesheet would
+        // stretch the panel between top and bottom instead of sizing to content.
+        this.panel.style.top = "auto";
+        this.panel.style.bottom = "68px";
+        this.panel.style.right = "16px";
+        return;
+      }
+      const rect = this.summary.getBoundingClientRect();
+      // Hang the panel below the whole masthead, not just the button, so it
+      // clears the bar instead of sitting flush against its bottom edge.
+      const bar =
+        typeof this.buttonHost.closest === "function"
+          ? this.buttonHost.closest("ytd-masthead, #masthead, #masthead-container")
+          : null;
+      const barBottom = bar ? bar.getBoundingClientRect().bottom : rect.bottom;
+      const viewportWidth = typeof window === "undefined" ? 0 : nonNegativeNumber(window.innerWidth);
+      this.panel.style.bottom = "auto";
+      this.panel.style.top = `${Math.round(Math.max(rect.bottom, barBottom) + 8)}px`;
+      this.panel.style.right = `${Math.max(12, Math.round(viewportWidth - rect.right))}px`;
+    }
+
+    toggle(next = !this.expanded) {
+      if (next === this.expanded) return;
+      this.expanded = next;
+      this.panel.hidden = !next;
+      this.summary.setAttribute("aria-expanded", String(next));
+      if (next) this.positionPanel();
+      this.render();
+      if (next) this.panel.focus();
+      else this.summary.focus();
     }
 
     makeAction(label, callback, danger = false, disabled = false) {
@@ -1645,6 +1901,9 @@ function makeDescription(channel) {
 
     render() {
       if (!this.host.isConnected) return;
+      this.placeButton();
+      this.syncTheme();
+
       const record = this.app.getOwnRecord();
       const currentMs = record.active ? record.active.durationMs : 0;
       const carryMs = carryDurationMs(record.carry);
@@ -1655,26 +1914,71 @@ function makeDescription(channel) {
       const errors = Array.isArray(storedErrors) ? storedErrors : [];
       const configErrors = validateConfig(this.app.config);
       const carryTransferProblem = this.app.getCarryTransferIssue();
+      // Expanding refreshes the scan the collapsed button is too hot to run.
+      const orphans = this.expanded ? this.app.refreshStaleCarry() : [];
       const identityPending = !this.app.identityResolved;
+      // Stale carry from a closed tab is never merged automatically, so the
+      // panel's attach-or-discard choice has to be advertised like any error.
       const issueCount =
-        decisions.length + configErrors.length + errors.length + (carryTransferProblem ? 1 : 0);
+        decisions.length +
+        configErrors.length +
+        errors.length +
+        this.app.staleCarryCount +
+        (carryTransferProblem ? 1 : 0);
+      const state = !record.active ? "idle" : this.app.playbackIsEligible() ? "tracking" : "paused";
 
-      this.shadow.getElementById("current").textContent = record.active
-        ? `${formatDuration(currentMs)} · ${record.active.channel.name || record.active.channel.id}`
-        : "0:00 · idle";
-      this.shadow.getElementById("carry").textContent = formatDuration(carryMs);
-      this.shadow.getElementById("queue").textContent = `${queue.length} (${pendingCount} pending)`;
-      this.shadow.getElementById("issues").textContent = String(issueCount);
-      this.summary.textContent = `YT → Toggl ${formatDuration(currentMs)} · Q${queue.length}`;
-      this.summary.dataset.state = issueCount ? "issue" : record.active ? "active" : "idle";
+      // The collapsed button reports state, never time.
+      setDataValue(this.summary, "state", state);
+      setDataValue(this.summary, "attention", issueCount ? "1" : "0");
+      setAttributeValue(
+        this.summary,
+        "aria-label",
+        issueCount
+          ? "YouTube watch time, needs attention"
+          : state === "tracking"
+            ? "YouTube watch time, tracking"
+            : state === "paused"
+              ? "YouTube watch time, tracking paused"
+              : "YouTube watch time",
+      );
       if (!this.expanded) return;
+
+      this.positionPanel();
+      this.shadow.getElementById("eyebrow").textContent =
+        state === "tracking" ? "NOW TRACKING" : state === "paused" ? "TRACKING PAUSED" : "NOT TRACKING";
+      this.shadow.getElementById("readout").textContent = formatDuration(currentMs);
+      this.shadow.getElementById("channel").textContent = record.active
+        ? record.active.channel.name || record.active.channel.id || "Unnamed channel"
+        : "Nothing playing";
+
+      const minimumMs = minimumDurationMs(this.app.config);
+      // Merge mode finalizes carry together with this session, so the boundary
+      // that decides whether the session is kept applies to the combined total.
+      const towardMinimumMs = this.app.config.mergeBelowMinimum ? carryMs + currentMs : currentMs;
+      const met = towardMinimumMs >= minimumMs;
+      const threshold = this.shadow.getElementById("threshold");
+      this.shadow.getElementById("threshold-group").hidden = !record.active;
+      threshold.dataset.state = met ? "met" : "below";
+      this.shadow.getElementById("threshold-fill").style.width = `${
+        minimumMs > 0 ? Math.round(Math.min(1, towardMinimumMs / minimumMs) * 100) : 100
+      }%`;
+      this.shadow.getElementById("threshold-caption").textContent = met
+        ? "COUNTING"
+        : `${formatDuration(minimumMs - towardMinimumMs)} UNTIL THIS COUNTS`;
+
+      this.shadow.getElementById("carry").textContent = formatDuration(carryMs);
+      this.shadow.getElementById("queue").textContent = pendingCount
+        ? `${queue.length} · ${pendingCount} pending`
+        : String(queue.length);
 
       const configBox = this.shadow.getElementById("config");
       configBox.replaceChildren();
       if (configErrors.length) {
         const notice = document.createElement("div");
         notice.className = "notice";
-        notice.textContent = configErrors.join(" ");
+        const text = document.createElement("p");
+        text.textContent = configErrors.join(" ");
+        notice.appendChild(text);
         configBox.appendChild(notice);
       }
 
@@ -1712,7 +2016,6 @@ function makeDescription(channel) {
         item.append(text, meta, actions);
         orphanBox.append(heading, item);
       }
-      const orphans = this.app.getStaleCarryRecords();
       if (orphans.length) {
         const heading = document.createElement("h3");
         heading.textContent = "Stale tab carry";
@@ -1775,10 +2078,13 @@ function makeDescription(channel) {
       if (errors.length) {
         const heading = document.createElement("h3");
         heading.textContent = "Latest error";
+        const item = document.createElement("div");
+        item.className = "item";
         const text = document.createElement("p");
         text.className = "meta";
         text.textContent = errors[errors.length - 1].message;
-        errorBox.append(heading, text);
+        item.appendChild(text);
+        errorBox.append(heading, item);
       }
     }
   }
@@ -1794,6 +2100,9 @@ function makeDescription(channel) {
       this.reusedTabId = tabIdentity.reused;
       this.identityResolved = false;
       this.identityGeneration = 0;
+      // Enumerating tab records is a full storage scan, so the collapsed button
+      // reads the count that recovery and panel expansion leave behind.
+      this.staleCarryCount = 0;
       this.instanceId = randomId("instance");
       this.sample = null;
       this.inactivityDeadline = null;
@@ -2105,6 +2414,12 @@ function makeDescription(channel) {
         .filter((record) => record.tabId);
     }
 
+    refreshStaleCarry(nowMs = Date.now()) {
+      const records = this.getStaleCarryRecords(nowMs);
+      this.staleCarryCount = records.length;
+      return records;
+    }
+
     getStaleCarryRecords(nowMs = Date.now()) {
       const expirationMs = inactivityMs(this.config);
       return this.getAllTabRecords().filter(
@@ -2118,6 +2433,13 @@ function makeDescription(channel) {
 
     getCarryTransferIssue() {
       return carryTransferIssue(this.store.get(CARRY_TRANSFER_KEY, null));
+    }
+
+    // An open session survives pauses, buffering, seeks, ended media, and ads
+    // until the inactivity boundary, but none of those states earn credit. The
+    // latest snapshot is the only thing that says whether time is accruing now.
+    playbackIsEligible() {
+      return Boolean(this.sample && this.sample.eligible);
     }
 
     withTabsLock(callback) {
@@ -2291,6 +2613,7 @@ function makeDescription(channel) {
         own.heartbeatMs = nowMs;
         own.instanceId = this.instanceId;
         this.store.set(tabStorageKey(this.tabId), own);
+        this.refreshStaleCarry(nowMs);
       });
     }
 
@@ -2320,6 +2643,7 @@ function makeDescription(channel) {
               this.store.delete(tabStorageKey(result.source.tabId));
             }
           }
+          this.refreshStaleCarry(nowMs);
         });
       });
     }
@@ -2345,6 +2669,7 @@ function makeDescription(channel) {
             throw new Error("That tab's expired session is still being recovered; try again shortly.");
           }
           this.store.delete(tabStorageKey(sourceTabId));
+          this.refreshStaleCarry(nowMs);
         });
       });
     }

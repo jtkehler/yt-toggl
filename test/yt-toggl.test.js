@@ -1910,7 +1910,7 @@ test("browser bootstrap stays inactive inside child frames", () => {
   assert.equal(typeof context.module.exports.BrowserApp, "function");
 });
 
-test("browser bootstrap mounts status under Trusted Types enforcement and stays offline", async () => {
+function createFakeDom() {
   function findById(node, id) {
     if (node.id === id) return node;
     for (const child of node.children) {
@@ -1920,13 +1920,51 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
     return null;
   }
 
-  function makeNode(tagName = "div") {
+  function matchesPart(node, part) {
+    if (part.startsWith("#")) return node.id === part.slice(1);
+    if (part.startsWith(".")) return node.classList.contains(part.slice(1));
+    return node.tagName === part.toUpperCase();
+  }
+
+  function descendants(node) {
+    const found = [];
+    for (const child of node.children) found.push(child, ...descendants(child));
+    return found;
+  }
+
+  function querySelectorIn(root, selector) {
+    const parts = selector.trim().split(/\s+/);
+    let scopes = [root];
+    for (const part of parts) {
+      const next = [];
+      for (const scope of scopes) {
+        for (const candidate of descendants(scope)) {
+          if (matchesPart(candidate, part)) next.push(candidate);
+        }
+      }
+      if (!next.length) return null;
+      scopes = next;
+    }
+    return scopes[0];
+  }
+
+  function makeNode(tagName = "div", namespaceURI = null) {
+    const classes = new Set();
     const node = {
       tagName: tagName.toUpperCase(),
+      namespaceURI,
       id: "",
+      parentNode: null,
       children: [],
       dataset: {},
-      classList: { contains: () => false },
+      style: {},
+      attributes: new Map(),
+      classList: {
+        contains: (name) => classes.has(name),
+        add: (...names) => names.forEach((name) => classes.add(name)),
+        remove: (...names) => names.forEach((name) => classes.delete(name)),
+        toggle: (name, force) => (force ? classes.add(name) : classes.delete(name)),
+      },
       hidden: false,
       isConnected: false,
       textContent: "",
@@ -1934,31 +1972,68 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
       addEventListener(name, callback) {
         this.eventListeners.set(name, callback);
       },
+      removeEventListener() {},
+      focus() {},
       setAttribute(name, value) {
+        this.attributes.set(name, String(value));
         this[name] = value;
       },
-      getAttribute() {
-        return null;
+      getAttribute(name) {
+        return this.attributes.has(name) ? this.attributes.get(name) : null;
       },
-      querySelector() {
-        return null;
+      hasAttribute(name) {
+        return this.attributes.has(name);
+      },
+      removeAttribute(name) {
+        this.attributes.delete(name);
+      },
+      getBoundingClientRect() {
+        return { top: 0, right: 900, bottom: 48, left: 860, width: 40, height: 40 };
+      },
+      contains(other) {
+        return other === this || descendants(this).includes(other);
+      },
+      querySelector(selector) {
+        return querySelectorIn(this, selector);
       },
       closest() {
         return null;
       },
-      appendChild(child) {
-        this.children.push(child);
+      remove() {
+        if (!this.parentNode) return;
+        const siblings = this.parentNode.children;
+        const index = siblings.indexOf(this);
+        if (index >= 0) siblings.splice(index, 1);
+        this.parentNode = null;
+        this.isConnected = false;
+      },
+      adopt(child) {
+        if (child.parentNode) child.remove();
+        child.parentNode = this;
         child.isConnected = true;
         return child;
       },
-      append(...children) {
-        this.children.push(...children);
+      appendChild(child) {
+        this.adopt(child);
+        this.children.push(child);
+        return child;
       },
-      replaceChildren(...children) {
-        this.children = children;
+      prepend(...incoming) {
+        for (const child of incoming) this.adopt(child);
+        this.children.unshift(...incoming);
+      },
+      append(...incoming) {
+        for (const child of incoming) this.adopt(child);
+        this.children.push(...incoming);
+      },
+      replaceChildren(...incoming) {
+        for (const child of this.children) child.parentNode = null;
+        for (const child of incoming) this.adopt(child);
+        this.children = incoming;
       },
       attachShadow() {
         const shadow = makeNode("shadow-root");
+        shadow.host = this;
         shadow.getElementById = (id) => findById(shadow, id);
         Object.defineProperty(shadow, "innerHTML", {
           set() {
@@ -1974,15 +2049,86 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
 
   const body = makeNode("body");
   const documentElement = makeNode("html");
+  documentElement.appendChild(body);
+  documentElement.isConnected = true;
+  const documentListeners = new Map();
+  const videos = [];
   const document = {
     body,
     documentElement,
     createElement: (tagName) => makeNode(tagName),
-    querySelectorAll: () => [],
-    querySelector: () => null,
+    createElementNS: (namespaceURI, tagName) => makeNode(tagName, namespaceURI),
+    querySelectorAll: (selector) => (selector === "video" ? videos : []),
+    querySelector: (selector) => querySelectorIn(documentElement, selector),
     getElementById: () => null,
-    addEventListener() {},
+    addEventListener(name, callback) {
+      if (!documentListeners.has(name)) documentListeners.set(name, []);
+      documentListeners.get(name).push(callback);
+    },
+    removeEventListener() {},
   };
+
+  // A controllable YouTube player, so eligibility can be driven the way the
+  // real page drives it: pausing, buffering, seeking, ending, and ad breaks.
+  function addPlayer({ videoId = "test", channelId = "UC-Veritasium", author = "Veritasium" } = {}) {
+    const player = {
+      adShowing: false,
+      classList: {
+        contains(name) {
+          return player.adShowing && (name === "ad-showing" || name === "ad-interrupting");
+        },
+      },
+      getVideoData: () => ({ video_id: videoId, channel_id: channelId, author }),
+    };
+    const video = {
+      paused: false,
+      ended: false,
+      readyState: 4,
+      seeking: false,
+      playbackRate: 1,
+      currentTime: 12,
+      currentSrc: `blob:${videoId}`,
+      played: { length: 1, start: () => 0, end: () => video.currentTime },
+      closest: (selector) =>
+        selector === "#movie_player" || selector === ".html5-video-player" ? player : null,
+    };
+    videos.push(video);
+    return { video, player };
+  }
+
+  function addMasthead() {
+    const masthead = makeNode("ytd-masthead");
+    masthead.id = "masthead";
+    const container = makeNode("div");
+    container.id = "container";
+    const end = makeNode("div");
+    end.id = "end";
+    const buttons = makeNode("div");
+    buttons.id = "buttons";
+    const create = makeNode("ytd-button-renderer");
+    create.id = "create-icon";
+    buttons.appendChild(create);
+    end.appendChild(buttons);
+    container.appendChild(end);
+    masthead.appendChild(container);
+    body.appendChild(masthead);
+    return buttons;
+  }
+
+  return {
+    document,
+    body,
+    documentElement,
+    makeNode,
+    findById,
+    documentListeners,
+    addMasthead,
+    addPlayer,
+  };
+}
+
+test("browser bootstrap mounts status under Trusted Types enforcement and stays offline", async () => {
+  const { document, body } = createFakeDom();
   const values = new Map();
   values.set("yt-toggl:tab:v1:stale-empty", createTabRecord("stale-empty", 0));
   const pendingPart = {
@@ -2217,7 +2363,8 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
   assert.equal(listValuesCount, collapsedScanCount, "collapsed ticks do not enumerate tab records");
 
   const host = body.children.find((child) => child.id === "yt-toggl-status-host");
-  const summary = host.shadowRoot.getElementById("summary");
+  const buttonHost = body.children.find((child) => child.id === "yt-toggl-button-host");
+  const summary = buttonHost.shadowRoot.getElementById("summary");
   summary.eventListeners.get("click")();
   assert.equal(listValuesCount, collapsedScanCount + 1, "expanding scans stale carry once");
   summary.eventListeners.get("click")();
@@ -2280,4 +2427,408 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
   );
   assert.equal(values.has(`yt-toggl:tab:v1:${delayedResponseTabId}`), true);
   assert.equal(requestCount, 0);
+});
+
+function bootUserscript(dom) {
+  const values = new Map();
+  const listeners = new Map();
+  const sessionValues = new Map();
+  const intervals = [];
+  const windowListeners = new Map();
+  let sequence = 0;
+
+  class SilentBroadcastChannel {
+    addEventListener() {}
+    postMessage() {}
+    close() {}
+  }
+
+  const context = {
+    URL,
+    TextEncoder,
+    Date,
+    Math,
+    JSON,
+    Promise,
+    Symbol,
+    console,
+    document: dom.document,
+    location: {
+      href: "https://www.youtube.com/watch?v=test",
+      pathname: "/watch",
+      search: "?v=test",
+    },
+    performance: { now: () => 1000 },
+    crypto: { randomUUID: () => `uuid-${++sequence}` },
+    navigator: {
+      locks: {
+        request: async (name, _options, callback) => callback({ name }),
+      },
+    },
+    sessionStorage: {
+      getItem: (key) => sessionValues.get(key) || null,
+      setItem: (key, value) => sessionValues.set(key, value),
+    },
+    BroadcastChannel: SilentBroadcastChannel,
+    GM_getValue: (key, fallback) => (values.has(key) ? values.get(key) : fallback),
+    GM_setValue: (key, value) => {
+      const oldValue = values.get(key);
+      values.set(key, value);
+      for (const callback of listeners.get(key) || []) callback(key, oldValue, value, false);
+    },
+    GM_deleteValue: (key) => values.delete(key),
+    GM_listValues: () => [...values.keys()],
+    GM_addValueChangeListener: (key, callback) => {
+      if (!listeners.has(key)) listeners.set(key, []);
+      listeners.get(key).push(callback);
+      return listeners.get(key).length;
+    },
+    GM_xmlhttpRequest: () => {},
+    unsafeWindow: {},
+    btoa: (input) => Buffer.from(input, "binary").toString("base64"),
+    setTimeout,
+    clearTimeout,
+    setInterval: (callback, delay) => {
+      intervals.push({ callback, delay });
+      return intervals.length;
+    },
+    clearInterval() {},
+    module: { exports: {} },
+  };
+  context.window = {
+    innerWidth: 1280,
+    innerHeight: 720,
+    addEventListener(name, callback) {
+      if (!windowListeners.has(name)) windowListeners.set(name, []);
+      windowListeners.get(name).push(callback);
+    },
+    confirm: () => true,
+  };
+
+  const source = fs.readFileSync(require.resolve("../yt-toggl.user.js"), "utf8");
+  vm.runInNewContext(source, context, { filename: "yt-toggl.user.js" });
+
+  const boot = {
+    context,
+    values,
+    sessionValues,
+    api: context.module.exports,
+    tick: () => intervals.find((interval) => interval.delay === SECOND).callback(),
+    recover: () => intervals.find((interval) => interval.delay === 30 * SECOND).callback(),
+    settle: () => new Promise((resolve) => setTimeout(resolve, 20)),
+  };
+  boot.rerender = () => context.GM_setValue("yt-toggl:queue:v1", values.get("yt-toggl:queue:v1") || []);
+  boot.seedActiveSession = (durationMs, name = "Veritasium", carryMs = 0) => {
+    const tabId = sessionValues.get("yt-toggl:tab-id:v1");
+    const record = createTabRecord(tabId, Date.now());
+    record.active = {
+      id: "ui-session",
+      channel: channel(name),
+      firstPlayMs: Date.now(),
+      lastEligibleAtMs: Date.now(),
+      durationMs,
+    };
+    if (carryMs > 0) {
+      record.carry = {
+        parts: [
+          { id: "ui-carry", durationMs: carryMs, sourceTabId: tabId, createdAtMs: Date.now() },
+        ],
+      };
+    }
+    values.set(`yt-toggl:tab:v1:${tabId}`, record);
+    boot.rerender();
+  };
+  return boot;
+}
+
+function findDescendant(root, id) {
+  const pending = [root];
+  while (pending.length) {
+    const node = pending.shift();
+    if (node.id === id) return node;
+    pending.push(...node.children);
+  }
+  return null;
+}
+
+function collectText(node) {
+  let text = node.textContent || "";
+  for (const child of node.children) text += collectText(child);
+  return text;
+}
+
+test("the status button mounts inside the YouTube masthead", async () => {
+  const dom = createFakeDom();
+  const buttons = dom.addMasthead();
+  const boot = bootUserscript(dom);
+  await boot.settle();
+
+  const host = buttons.children.find((child) => child.id === "yt-toggl-button-host");
+  assert.notEqual(host, undefined, "the button is injected into the masthead");
+  assert.equal(buttons.children[0], host, "it leads YouTube's own masthead buttons");
+  assert.equal(host.dataset.placement, "masthead");
+  assert.equal(
+    dom.body.children.some((child) => child.id === "yt-toggl-button-host"),
+    false,
+    "no floating button is left behind on the body",
+  );
+  assert.equal(
+    dom.body.children.some((child) => child.id === "yt-toggl-status-host"),
+    true,
+    "the panel host stays on the body, clear of the masthead's transforms",
+  );
+});
+
+test("the status button falls back to a floating mount without a masthead", async () => {
+  const dom = createFakeDom();
+  const boot = bootUserscript(dom);
+  await boot.settle();
+
+  const host = dom.body.children.find((child) => child.id === "yt-toggl-button-host");
+  assert.notEqual(host, undefined, "the button still mounts when the masthead is missing");
+  assert.equal(host.dataset.placement, "floating");
+});
+
+test("the masthead button returns after YouTube rebuilds its button row", async () => {
+  const dom = createFakeDom();
+  const buttons = dom.addMasthead();
+  const boot = bootUserscript(dom);
+  await boot.settle();
+
+  buttons.children.find((child) => child.id === "yt-toggl-button-host").remove();
+  assert.equal(buttons.children.some((child) => child.id === "yt-toggl-button-host"), false);
+
+  await boot.tick();
+  assert.equal(
+    buttons.children.some((child) => child.id === "yt-toggl-button-host"),
+    true,
+    "the next tick re-injects the button",
+  );
+});
+
+test("the collapsed button signals tracking and attention without showing the time", async () => {
+  const dom = createFakeDom();
+  const buttons = dom.addMasthead();
+  const boot = bootUserscript(dom);
+  await boot.settle();
+  boot.api.CONFIG.togglApiToken = "token";
+  boot.api.CONFIG.togglWorkspaceId = 7;
+
+  const host = buttons.children.find((child) => child.id === "yt-toggl-button-host");
+  const summary = host.shadowRoot.getElementById("summary");
+
+  boot.rerender();
+  assert.equal(summary.dataset.state, "idle");
+
+  const media = dom.addPlayer();
+  await boot.tick();
+  await boot.settle();
+  assert.equal(summary.dataset.state, "tracking");
+  assert.equal(summary.dataset.attention, "0");
+  assert.equal(
+    /\d/.test(collectText(host)),
+    false,
+    "the collapsed button never renders a duration",
+  );
+
+  media.video.paused = true;
+  await boot.tick();
+  await boot.settle();
+  assert.notEqual(boot.values.get(`yt-toggl:tab:v1:${boot.sessionValues.get("yt-toggl:tab-id:v1")}`).active, null);
+  assert.equal(
+    summary.dataset.state,
+    "paused",
+    "a session held open across a pause must not claim time is accruing",
+  );
+
+  boot.values.set("yt-toggl:errors:v1", [{ message: "Toggl rejected the token", atMs: 1 }]);
+  boot.rerender();
+  assert.equal(summary.dataset.attention, "1");
+});
+
+test("playback states that earn no credit read as paused, not as tracking", async () => {
+  const dom = createFakeDom();
+  const buttons = dom.addMasthead();
+  const media = dom.addPlayer();
+  const boot = bootUserscript(dom);
+  await boot.settle();
+  boot.api.CONFIG.togglApiToken = "token";
+  boot.api.CONFIG.togglWorkspaceId = 7;
+
+  const buttonHost = buttons.children.find((child) => child.id === "yt-toggl-button-host");
+  const summary = buttonHost.shadowRoot.getElementById("summary");
+  const panelHost = dom.body.children.find((child) => child.id === "yt-toggl-status-host");
+  summary.eventListeners.get("click")();
+  const eyebrow = panelHost.shadowRoot.getElementById("eyebrow");
+
+  await boot.tick();
+  await boot.settle();
+  assert.equal(summary.dataset.state, "tracking");
+  assert.equal(eyebrow.textContent, "NOW TRACKING");
+
+  const excluded = [
+    ["a pause", () => (media.video.paused = true), () => (media.video.paused = false)],
+    ["buffering", () => (media.video.readyState = 1), () => (media.video.readyState = 4)],
+    ["a seek", () => (media.video.seeking = true), () => (media.video.seeking = false)],
+    ["ended media", () => (media.video.ended = true), () => (media.video.ended = false)],
+    ["an ad break", () => (media.player.adShowing = true), () => (media.player.adShowing = false)],
+  ];
+  for (const [label, enter, leave] of excluded) {
+    enter();
+    await boot.tick();
+    await boot.settle();
+    assert.equal(summary.dataset.state, "paused", `${label} earns no credit`);
+    assert.equal(eyebrow.textContent, "TRACKING PAUSED");
+    assert.equal(
+      summary.getAttribute("aria-label"),
+      "YouTube watch time, tracking paused",
+    );
+    leave();
+    await boot.tick();
+    await boot.settle();
+    assert.equal(summary.dataset.state, "tracking", `resuming after ${label} tracks again`);
+  }
+});
+
+test("stale carry from a closed tab raises the attention dot", async () => {
+  const dom = createFakeDom();
+  const buttons = dom.addMasthead();
+  const boot = bootUserscript(dom);
+  await boot.settle();
+  boot.api.CONFIG.togglApiToken = "token";
+  boot.api.CONFIG.togglWorkspaceId = 7;
+
+  const buttonHost = buttons.children.find((child) => child.id === "yt-toggl-button-host");
+  const summary = buttonHost.shadowRoot.getElementById("summary");
+  const panelHost = dom.body.children.find((child) => child.id === "yt-toggl-status-host");
+
+  boot.rerender();
+  assert.equal(summary.dataset.attention, "0");
+
+  const stale = createTabRecord("closed-tab", 0);
+  stale.carry = {
+    parts: [
+      { id: "closed-part", durationMs: 40 * SECOND, sourceTabId: "closed-tab", createdAtMs: 0 },
+    ],
+  };
+  boot.values.set("yt-toggl:tab:v1:closed-tab", stale);
+  await boot.recover();
+  await boot.settle();
+  assert.equal(
+    summary.dataset.attention,
+    "1",
+    "the attach-or-discard decision must be discoverable from the collapsed button",
+  );
+
+  summary.eventListeners.get("click")();
+  const orphanBox = panelHost.shadowRoot.getElementById("orphans");
+  const discard = (() => {
+    const pending = [orphanBox];
+    while (pending.length) {
+      const node = pending.shift();
+      if (node.textContent === "Discard") return node;
+      pending.push(...node.children);
+    }
+    return null;
+  })();
+  assert.notEqual(discard, null, "the panel offers the explicit discard");
+  discard.eventListeners.get("click")();
+  await boot.settle();
+  assert.equal(boot.values.has("yt-toggl:tab:v1:closed-tab"), false);
+  assert.equal(summary.dataset.attention, "0", "resolving the decision clears the dot");
+});
+
+test("the panel reveals the tracked time and when it starts counting", async () => {
+  const dom = createFakeDom();
+  const buttons = dom.addMasthead();
+  const boot = bootUserscript(dom);
+  await boot.settle();
+  boot.api.CONFIG.togglApiToken = "token";
+  boot.api.CONFIG.togglWorkspaceId = 7;
+
+  const buttonHost = buttons.children.find((child) => child.id === "yt-toggl-button-host");
+  const summary = buttonHost.shadowRoot.getElementById("summary");
+  const panelHost = dom.body.children.find((child) => child.id === "yt-toggl-status-host");
+  const panel = panelHost.shadowRoot.getElementById("panel");
+
+  boot.seedActiveSession(12 * SECOND);
+  assert.equal(panel.hidden, true, "the panel starts collapsed");
+
+  summary.eventListeners.get("click")();
+  assert.equal(panel.hidden, false);
+  assert.equal(summary.getAttribute("aria-expanded"), "true");
+  assert.equal(panelHost.shadowRoot.getElementById("readout").textContent, "0:12");
+  assert.equal(findDescendant(panel, "channel").textContent, "Veritasium");
+  assert.equal(
+    findDescendant(panel, "threshold-caption").textContent,
+    "0:48 UNTIL THIS COUNTS",
+    "the panel names the minimum-duration boundary that decides whether time is kept",
+  );
+
+  boot.seedActiveSession(90 * SECOND);
+  assert.equal(panelHost.shadowRoot.getElementById("readout").textContent, "1:30");
+  assert.equal(findDescendant(panel, "threshold-caption").textContent, "COUNTING");
+});
+
+test("the panel measures the minimum against the time finalization would queue", async () => {
+  const dom = createFakeDom();
+  const buttons = dom.addMasthead();
+  const boot = bootUserscript(dom);
+  await boot.settle();
+  boot.api.CONFIG.togglApiToken = "token";
+  boot.api.CONFIG.togglWorkspaceId = 7;
+
+  const buttonHost = buttons.children.find((child) => child.id === "yt-toggl-button-host");
+  const summary = buttonHost.shadowRoot.getElementById("summary");
+  const panelHost = dom.body.children.find((child) => child.id === "yt-toggl-status-host");
+  const panel = panelHost.shadowRoot.getElementById("panel");
+  summary.eventListeners.get("click")();
+
+  boot.api.CONFIG.mergeBelowMinimum = true;
+  boot.seedActiveSession(20 * SECOND, "Veritasium", 50 * SECOND);
+  const record = boot.values.get(`yt-toggl:tab:v1:${boot.sessionValues.get("yt-toggl:tab-id:v1")}`);
+  const finalized = boot.api.finalizeTabRecord(record, boot.api.CONFIG, undefined, "finalized", Date.now());
+  assert.equal(finalized.disposition, "queued", "merge mode queues the combined 70 seconds");
+  assert.equal(finalized.entry.duration, 70);
+  assert.equal(
+    findDescendant(panel, "threshold-caption").textContent,
+    "COUNTING",
+    "carried time counts toward the minimum in merge mode",
+  );
+  assert.equal(findDescendant(panel, "threshold-fill").style.width, "100%");
+
+  boot.api.CONFIG.mergeBelowMinimum = false;
+  boot.rerender();
+  assert.equal(
+    findDescendant(panel, "threshold-caption").textContent,
+    "0:40 UNTIL THIS COUNTS",
+    "discard mode drops the carry, so only this session counts",
+  );
+});
+
+test("the panel closes on an outside click and on Escape", async () => {
+  const dom = createFakeDom();
+  const buttons = dom.addMasthead();
+  const boot = bootUserscript(dom);
+  await boot.settle();
+
+  const buttonHost = buttons.children.find((child) => child.id === "yt-toggl-button-host");
+  const summary = buttonHost.shadowRoot.getElementById("summary");
+  const panelHost = dom.body.children.find((child) => child.id === "yt-toggl-status-host");
+  const panel = panelHost.shadowRoot.getElementById("panel");
+  const documentClick = (dom.documentListeners.get("click") || []).at(-1);
+  const documentKeydown = (dom.documentListeners.get("keydown") || []).at(-1);
+
+  summary.eventListeners.get("click")();
+  documentClick({ target: dom.body, composedPath: () => [panelHost] });
+  assert.equal(panel.hidden, false, "clicks inside the panel keep it open");
+
+  documentClick({ target: dom.body, composedPath: () => [dom.body] });
+  assert.equal(panel.hidden, true, "a click elsewhere on the page closes it");
+  assert.equal(summary.getAttribute("aria-expanded"), "false");
+
+  summary.eventListeners.get("click")();
+  assert.equal(panel.hidden, false);
+  documentKeydown({ key: "Escape" });
+  assert.equal(panel.hidden, true, "Escape closes it");
 });
