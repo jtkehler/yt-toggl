@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         YouTube Watch Time → Toggl
 // @namespace    https://github.com/local/yt-toggl
-// @version      1.0.0
+// @version      1.0.1
 // @description  Track eligible YouTube playback locally and create completed Toggl entries.
 // @author       You
 // @match        https://www.youtube.com/*
+// @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
@@ -51,12 +52,15 @@ function makeDescription(channel) {
   const AUTH_BLOCK_KEY = "yt-toggl:auth-block:v1";
   const ERRORS_KEY = "yt-toggl:errors:v1";
   const COMMAND_KEY = "yt-toggl:command:v1";
+  const INSTANCE_PROBE_KEY = "yt-toggl:instance-probe:v1";
+  const CARRY_TRANSFER_KEY = "yt-toggl:carry-transfer:v1";
   const LOCK_KEY_PREFIX = "yt-toggl:lease:v1:";
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const REQUEST_SPACING_MS = 1000;
   const DEFAULT_RATE_BACKOFF_MS = 2 * 60 * 1000;
   const REQUEST_TIMEOUT_MS = 30 * 1000;
   const TICK_INTERVAL_MS = 1000;
+  const TAB_HEARTBEAT_GRACE_MS = 5 * TICK_INTERVAL_MS;
   const WORKER_INTERVAL_MS = 30 * 1000;
   const MAX_ERROR_HISTORY = 12;
   const LOCK_UNAVAILABLE = Symbol("lock-unavailable");
@@ -130,7 +134,13 @@ function makeDescription(channel) {
     const seen = new Set();
     return {
       parts: parts
-        .filter((part) => part && typeof part.id === "string" && finiteNumber(part.durationMs) > 0)
+        .filter(
+          (part) =>
+            part &&
+            typeof part.id === "string" &&
+            normalizedText(part.id) &&
+            finiteNumber(part.durationMs) > 0,
+        )
         .filter((part) => {
           if (seen.has(part.id)) return false;
           seen.add(part.id);
@@ -247,6 +257,16 @@ function makeDescription(channel) {
     return Math.max(0, Math.min(wallMs, progressEquivalentMs));
   }
 
+  function playbackBridgesInactivity(previous, current, creditedMs, expirationMs) {
+    if (!previous || creditedMs <= 0) return false;
+    const wallElapsedMs = Math.max(0, current.nowMs - previous.nowMs);
+    const monotonicElapsedMs = Math.max(0, current.monotonicMs - previous.monotonicMs);
+    return (
+      wallElapsedMs - creditedMs < expirationMs &&
+      monotonicElapsedMs - creditedMs < expirationMs
+    );
+  }
+
   function makeQueueEntry(session, totalDurationMs, reason, nowMs, descriptionFn = makeDescription) {
     return {
       schemaVersion: SCHEMA_VERSION,
@@ -318,16 +338,97 @@ function makeDescription(channel) {
       this.idFactory = options.idFactory || randomId;
       this.record = normalizeTabRecord(record, (record && record.tabId) || "test-tab");
       this.sample = null;
+      this.inactivityDeadline = options.inactivityDeadline || null;
     }
 
-    startSession(channel, nowMs) {
-      this.record.active = makeSession(channel, nowMs, this.idFactory);
+    resetInactivityDeadline(snapshot) {
+      if (!this.record.active) {
+        this.inactivityDeadline = null;
+        return;
+      }
+      const expirationMs = inactivityMs(this.config);
+      this.inactivityDeadline = {
+        sessionId: this.record.active.id,
+        atMonotonicMs: snapshot.monotonicMs + expirationMs,
+        atWallMs: snapshot.nowMs + expirationMs,
+        lastObservedWallMs: snapshot.nowMs,
+      };
+    }
+
+    ensureInactivityDeadline(snapshot) {
+      if (!this.record.active) {
+        this.inactivityDeadline = null;
+        return null;
+      }
+      const hasMonotonicDeadline = Boolean(
+        this.inactivityDeadline &&
+          this.inactivityDeadline.sessionId === this.record.active.id &&
+          Number.isFinite(this.inactivityDeadline.atMonotonicMs),
+      );
+      if (!hasMonotonicDeadline) {
+        const expirationMs = inactivityMs(this.config);
+        const wallElapsedMs = Math.max(0, snapshot.nowMs - this.record.active.lastEligibleAtMs);
+        const remainingMs = Math.max(0, expirationMs - wallElapsedMs);
+        this.inactivityDeadline = {
+          sessionId: this.record.active.id,
+          atMonotonicMs: snapshot.monotonicMs + remainingMs,
+          atWallMs: snapshot.nowMs + remainingMs,
+          lastObservedWallMs: snapshot.nowMs,
+        };
+        this.record.active.lastEligibleAtMs = Math.max(
+          0,
+          this.inactivityDeadline.atWallMs - expirationMs,
+        );
+      } else {
+        if (!Number.isFinite(this.inactivityDeadline.atWallMs)) {
+          const expirationMs = inactivityMs(this.config);
+          const wallElapsedMs = Math.max(0, snapshot.nowMs - this.record.active.lastEligibleAtMs);
+          const wallRemainingMs = Math.max(0, expirationMs - wallElapsedMs);
+          const monotonicRemainingMs = Math.max(
+            0,
+            this.inactivityDeadline.atMonotonicMs - snapshot.monotonicMs,
+          );
+          this.inactivityDeadline.atWallMs =
+            snapshot.nowMs + Math.min(wallRemainingMs, monotonicRemainingMs);
+        }
+        if (!Number.isFinite(this.inactivityDeadline.lastObservedWallMs)) {
+          this.inactivityDeadline.lastObservedWallMs = snapshot.nowMs;
+        }
+        if (snapshot.nowMs < this.inactivityDeadline.lastObservedWallMs) {
+          const monotonicRemainingMs = Math.max(
+            0,
+            this.inactivityDeadline.atMonotonicMs - snapshot.monotonicMs,
+          );
+          this.inactivityDeadline.atWallMs = snapshot.nowMs + monotonicRemainingMs;
+          // Persist the equivalent wall anchor so reload/closed-tab recovery
+          // retains elapsed inactivity after this in-memory deadline is lost.
+          this.record.active.lastEligibleAtMs = Math.max(
+            0,
+            this.inactivityDeadline.atWallMs - inactivityMs(this.config),
+          );
+        }
+        this.inactivityDeadline.lastObservedWallMs = snapshot.nowMs;
+      }
+      return this.inactivityDeadline;
+    }
+
+    startSession(channel, snapshot, initialDurationMs = 0) {
+      const durationMs = nonNegativeNumber(initialDurationMs);
+      this.record.active = makeSession(
+        channel,
+        Math.max(0, snapshot.nowMs - durationMs),
+        this.idFactory,
+      );
+      this.record.active.durationMs = durationMs;
+      this.record.active.lastEligibleAtMs = snapshot.nowMs;
+      this.resetInactivityDeadline(snapshot);
     }
 
     finalize(reason, nowMs) {
       const result = finalizeTabRecord(this.record, this.config, this.descriptionFn, reason, nowMs);
       this.record = result.record;
       this.sample = null;
+      this.inactivityDeadline = null;
       return result.entry;
     }
 
@@ -344,25 +445,44 @@ function makeDescription(channel) {
         if (entry) entries.push(entry);
       }
 
-      if (this.record.active && this.sample && snapshot.channel) {
-        const creditedMs = validatedPlaybackMs(this.sample, snapshot);
-        if (creditedMs > 0) {
-          this.record.active.durationMs += creditedMs;
-          this.record.active.lastEligibleAtMs = snapshot.nowMs;
-          this.record.active.channel = mergeChannel(this.record.active.channel, snapshot.channel);
+      const inactivityDeadline = this.ensureInactivityDeadline(snapshot);
+      const deadlineReached = Boolean(
+        inactivityDeadline &&
+          (snapshot.monotonicMs >= inactivityDeadline.atMonotonicMs ||
+            snapshot.nowMs >= inactivityDeadline.atWallMs),
+      );
+      const creditedMs =
+        this.record.active && this.sample && snapshot.channel
+          ? validatedPlaybackMs(this.sample, snapshot)
+          : 0;
+      const playbackBridgesDeadline =
+        deadlineReached &&
+        playbackBridgesInactivity(
+          this.sample,
+          snapshot,
+          creditedMs,
+          inactivityMs(this.config),
+        );
+
+      let creditedReplacement = false;
+      if (deadlineReached && !playbackBridgesDeadline) {
+        const entry = this.finalize("inactivity", snapshot.nowMs);
+        if (entry) entries.push(entry);
+        if (creditedMs > 0 && snapshot.channel) {
+          this.startSession(snapshot.channel, snapshot, creditedMs);
+          creditedReplacement = true;
         }
       }
 
-      if (
-        this.record.active &&
-        snapshot.nowMs - this.record.active.lastEligibleAtMs >= inactivityMs(this.config)
-      ) {
-        const entry = this.finalize("inactivity", snapshot.nowMs);
-        if (entry) entries.push(entry);
+      if (this.record.active && creditedMs > 0 && !creditedReplacement) {
+        this.record.active.durationMs += creditedMs;
+        this.record.active.lastEligibleAtMs = snapshot.nowMs;
+        this.record.active.channel = mergeChannel(this.record.active.channel, snapshot.channel);
+        this.resetInactivityDeadline(snapshot);
       }
 
       if (snapshot.eligible && snapshot.channel) {
-        if (!this.record.active) this.startSession(snapshot.channel, snapshot.nowMs);
+        if (!this.record.active) this.startSession(snapshot.channel, snapshot);
         else this.record.active.channel = mergeChannel(this.record.active.channel, snapshot.channel);
       }
 
@@ -378,7 +498,7 @@ function makeDescription(channel) {
         if (entry) entries.push(entry);
       }
       if (snapshot.eligible && snapshot.channel) {
-        this.startSession(snapshot.channel, snapshot.nowMs);
+        this.startSession(snapshot.channel, snapshot);
         this.sample = snapshot;
       }
       return entries;
@@ -413,6 +533,17 @@ function makeDescription(channel) {
     return result;
   }
 
+  function tabRecordIsPrunable(record, currentTabId, nowMs, config = CONFIG) {
+    const normalized = normalizeTabRecord(record, record && record.tabId, nowMs);
+    return Boolean(
+      normalized.tabId &&
+        normalized.tabId !== currentTabId &&
+        !normalized.active &&
+        carryDurationMs(normalized.carry) === 0 &&
+        nowMs - normalized.heartbeatMs >= inactivityMs(config),
+    );
+  }
+
   function attachCarry(targetRecord, sourceRecord, nowMs = Date.now()) {
     const target = normalizeTabRecord(targetRecord, targetRecord && targetRecord.tabId, nowMs);
     const source = normalizeTabRecord(sourceRecord, sourceRecord && sourceRecord.tabId, nowMs);
@@ -425,6 +556,154 @@ function makeDescription(channel) {
     const next = normalizeTabRecord(record, record && record.tabId, nowMs);
     next.carry = { parts: [] };
     return next;
+  }
+
+  function normalizeCarryTransfer(transfer) {
+    if (!transfer || typeof transfer !== "object" || transfer.schemaVersion !== 1) return null;
+    const id = normalizedText(transfer.id);
+    const sourceTabId = normalizedText(transfer.sourceTabId);
+    const targetTabId = normalizedText(transfer.targetTabId);
+    const rawParts = Array.isArray(transfer.parts) ? transfer.parts : [];
+    const parts = normalizeCarry({ parts: rawParts }).parts;
+    const partsHaveStableIds = rawParts.every(
+      (part) =>
+        part &&
+        typeof part.id === "string" &&
+        part.id === normalizedText(part.id),
+    );
+    if (
+      !id ||
+      !sourceTabId ||
+      !targetTabId ||
+      sourceTabId === targetTabId ||
+      parts.length === 0 ||
+      parts.length !== rawParts.length ||
+      !partsHaveStableIds
+    ) {
+      return null;
+    }
+    return {
+      schemaVersion: 1,
+      id,
+      sourceTabId,
+      targetTabId,
+      parts,
+      createdAtMs: nonNegativeNumber(transfer.createdAtMs),
+      targetInstanceId: normalizedText(transfer.targetInstanceId),
+    };
+  }
+
+  function createCarryTransfer(
+    sourceRecord,
+    targetTabId,
+    targetInstanceId,
+    nowMs = Date.now(),
+    idFactory = randomId,
+  ) {
+    const source = normalizeTabRecord(sourceRecord, sourceRecord && sourceRecord.tabId, nowMs);
+    const normalizedTargetTabId = normalizedText(targetTabId);
+    const parts = normalizeCarry(source.carry).parts;
+    if (!source.tabId || !normalizedTargetTabId || source.tabId === normalizedTargetTabId || !parts.length) {
+      return null;
+    }
+    return {
+      schemaVersion: 1,
+      id: idFactory("carry-transfer", nowMs),
+      sourceTabId: source.tabId,
+      targetTabId: normalizedTargetTabId,
+      parts,
+      createdAtMs: nowMs,
+      targetInstanceId: normalizedText(targetInstanceId),
+    };
+  }
+
+  function carryTransferIssue(rawTransfer) {
+    if (rawTransfer === null || rawTransfer === undefined || normalizeCarryTransfer(rawTransfer)) {
+      return null;
+    }
+    const unsupportedSchema = Boolean(
+      rawTransfer &&
+        typeof rawTransfer === "object" &&
+        Object.prototype.hasOwnProperty.call(rawTransfer, "schemaVersion") &&
+        rawTransfer.schemaVersion !== 1,
+    );
+    return {
+      status: "unreadable",
+      kind: unsupportedSchema ? "unsupported-schema" : "malformed",
+      fingerprint: JSON.stringify(rawTransfer),
+      rawTransfer,
+    };
+  }
+
+  function completeCarryTransfer(store) {
+    const rawTransfer = store.get(CARRY_TRANSFER_KEY, null);
+    if (rawTransfer === null || rawTransfer === undefined) return null;
+    const transfer = normalizeCarryTransfer(rawTransfer);
+    if (!transfer) {
+      return carryTransferIssue(rawTransfer);
+    }
+
+    const target = normalizeTabRecord(
+      store.get(tabStorageKey(transfer.targetTabId), null),
+      transfer.targetTabId,
+      transfer.createdAtMs,
+    );
+    target.carry = mergeCarry(target.carry, { parts: transfer.parts });
+    target.heartbeatMs = Math.max(target.heartbeatMs, transfer.createdAtMs);
+    if (!target.instanceId) target.instanceId = transfer.targetInstanceId;
+    store.set(tabStorageKey(transfer.targetTabId), target);
+
+    const transferredIds = new Set(transfer.parts.map((part) => part.id));
+    const source = normalizeTabRecord(
+      store.get(tabStorageKey(transfer.sourceTabId), null),
+      transfer.sourceTabId,
+      transfer.createdAtMs,
+    );
+    source.carry = normalizeCarry({
+      parts: source.carry.parts.filter((part) => !transferredIds.has(part.id)),
+    });
+    store.set(tabStorageKey(transfer.sourceTabId), source);
+
+    // Initial versions could leave a part in both records if attachment was
+    // interrupted between their writes. A new explicit transfer designates one
+    // owner, so remove any still-carried legacy copies everywhere else.
+    for (const key of store.keys()) {
+      const tabId = tabIdFromStorageKey(key);
+      if (!tabId || tabId === transfer.targetTabId || tabId === transfer.sourceTabId) continue;
+      const record = normalizeTabRecord(store.get(key, null), tabId, transfer.createdAtMs);
+      const parts = record.carry.parts.filter((part) => !transferredIds.has(part.id));
+      if (parts.length === record.carry.parts.length) continue;
+      record.carry = normalizeCarry({ parts });
+      store.set(key, record);
+    }
+
+    store.delete(CARRY_TRANSFER_KEY);
+    return { transfer, target, source };
+  }
+
+  function discardCarryTransferJournal(store, expectedFingerprint) {
+    const rawTransfer = store.get(CARRY_TRANSFER_KEY, null);
+    if (rawTransfer === null || rawTransfer === undefined) return false;
+    const issue = carryTransferIssue(rawTransfer);
+    if (!issue) {
+      throw new Error("The saved carry transfer is now readable and was not discarded.");
+    }
+    if (issue.fingerprint !== expectedFingerprint) {
+      throw new Error("The saved carry transfer changed and was not discarded.");
+    }
+    store.delete(CARRY_TRANSFER_KEY);
+    return true;
+  }
+
+  function beginCarryTransfer(store, transfer) {
+    const normalized = normalizeCarryTransfer(transfer);
+    if (!normalized) throw new Error("Cannot start an invalid carry transfer.");
+    const existing = store.get(CARRY_TRANSFER_KEY, null);
+    if (existing !== null && existing !== undefined) {
+      throw new Error("Another carry transfer must be recovered before starting a new one.");
+    }
+    store.set(CARRY_TRANSFER_KEY, normalized);
+    return completeCarryTransfer(store);
   }
 
   function validateConfig(config = CONFIG) {
@@ -674,8 +953,37 @@ function makeDescription(channel) {
     );
   }
 
+  function closestTrackablePlayer(video) {
+    if (!video || typeof video.closest !== "function") return null;
+    try {
+      const moviePlayer = video.closest("#movie_player");
+      if (moviePlayer) return moviePlayer;
+
+      // Shorts can briefly expose the active reel before its player receives
+      // the stable movie_player ID. Restrict that fallback to the active reel;
+      // browse-page thumbnail previews must never become playback candidates.
+      if (video.closest("ytd-reel-video-renderer[is-active]")) {
+        return video.closest(".html5-video-player");
+      }
+    } catch (_error) {
+      // YouTube may detach or replace the video's ancestors while navigating.
+    }
+    return null;
+  }
+
+  function isTopLevelBrowsingContext() {
+    if (typeof window === "undefined") return false;
+    try {
+      return window.self === window.top;
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function selectActiveVideo(videos) {
-    const list = Array.from(videos || []).filter(Boolean);
+    const list = Array.from(videos || []).filter(
+      (video) => video && closestTrackablePlayer(video),
+    );
     return (
       list.find((video) => !video.paused && !video.ended && finiteNumber(video.readyState) >= 2) ||
       list.find((video) => video.closest && video.closest("ytd-reel-video-renderer[is-active]")) ||
@@ -793,21 +1101,21 @@ function makeDescription(channel) {
     return key.startsWith(TAB_KEY_PREFIX) ? key.slice(TAB_KEY_PREFIX.length) : "";
   }
 
-  function getOrCreateTabId() {
+  function getOrCreateTabIdentity() {
     try {
       let tabId = sessionStorage.getItem(TAB_ID_SESSION_KEY);
-      if (!tabId) {
-        tabId = randomId("tab");
-        sessionStorage.setItem(TAB_ID_SESSION_KEY, tabId);
-      }
-      return tabId;
+      if (tabId) return { tabId, reused: true };
+      tabId = randomId("tab");
+      sessionStorage.setItem(TAB_ID_SESSION_KEY, tabId);
+      return { tabId, reused: false };
     } catch (_error) {
-      return randomId("tab");
+      return { tabId: randomId("tab"), reused: false };
     }
   }
 
   function appendError(store, message, kind = "runtime", nowMs = Date.now()) {
-    const errors = Array.isArray(store.get(ERRORS_KEY, [])) ? store.get(ERRORS_KEY, []) : [];
+    const storedErrors = store.get(ERRORS_KEY, []);
+    const errors = Array.isArray(storedErrors) ? storedErrors : [];
     errors.push({ id: randomId("error", nowMs), atMs: nowMs, kind, message: normalizedText(message) });
     store.set(ERRORS_KEY, errors.slice(-MAX_ERROR_HISTORY));
   }
@@ -879,7 +1187,7 @@ function makeDescription(channel) {
       for (let candidate of candidates) {
         if (typeof candidate === "string") candidate = JSON.parse(candidate);
         const details = candidate && candidate.videoDetails;
-        if (details && (!videoId || !details.videoId || details.videoId === videoId)) return details;
+        if (details && (!videoId || normalizedText(details.videoId) === videoId)) return details;
       }
     } catch (_error) {
       // DOM/player fallbacks below are enough when page globals are unavailable.
@@ -908,9 +1216,9 @@ function makeDescription(channel) {
     if (!video) {
       return normalizeSnapshot({ nowMs, monotonicMs, discontinuityToken });
     }
+    const neutralSnapshot = () => normalizeSnapshot({ nowMs, monotonicMs, discontinuityToken });
 
-    const player =
-      (video.closest && video.closest(".html5-video-player")) || document.getElementById("movie_player");
+    const player = closestTrackablePlayer(video);
     let videoData = safeVideoData(player);
     if (!Object.keys(videoData).length) {
       try {
@@ -923,15 +1231,41 @@ function makeDescription(channel) {
         // Initial player response and DOM metadata remain as fallbacks.
       }
     }
-    const videoId = normalizedText(videoData.video_id || videoData.videoId);
-    const expectedVideoId = videoId || pageVideoId();
+    const playerHasAd = Boolean(
+      player &&
+        player.classList &&
+        (player.classList.contains("ad-showing") || player.classList.contains("ad-interrupting")),
+    );
+    const dataHasAd = Boolean(videoData.isAd || videoData.is_ad);
+    // Ad metadata can identify the advertiser, and player metadata can lag the
+    // destination route during navigation. Neither state may create content
+    // attribution until the content identity is coherent again.
+    if (playerHasAd || dataHasAd) return neutralSnapshot();
+
+    const routeVideoId = pageVideoId();
+    const playerVideoId = normalizedText(videoData.video_id || videoData.videoId);
+    if (routeVideoId && playerVideoId && routeVideoId !== playerVideoId) return neutralSnapshot();
+
+    let expectedVideoId = routeVideoId || playerVideoId;
     const initialDetails = currentInitialPlayerResponse(expectedVideoId);
-    if (!videoData.channel_id && initialDetails.channelId) {
+    const initialVideoId = normalizedText(initialDetails.videoId);
+    if (routeVideoId && !playerVideoId && initialVideoId !== routeVideoId) return neutralSnapshot();
+    if (initialVideoId && (!expectedVideoId || initialVideoId === expectedVideoId)) {
+      expectedVideoId = expectedVideoId || initialVideoId;
+      const identifiedPlayerData = playerVideoId ? videoData : {};
       videoData = {
-        ...videoData,
-        channel_id: initialDetails.channelId,
-        author: videoData.author || initialDetails.author,
-        video_id: videoId || initialDetails.videoId,
+        ...identifiedPlayerData,
+        channel_id:
+          initialDetails.channelId ||
+          identifiedPlayerData.channel_id ||
+          identifiedPlayerData.channelId ||
+          "",
+        author:
+          initialDetails.author ||
+          identifiedPlayerData.author ||
+          identifiedPlayerData.ownerChannelName ||
+          "",
+        video_id: expectedVideoId,
       };
     }
 
@@ -948,26 +1282,17 @@ function makeDescription(channel) {
       name: fallbackName,
     });
 
-    const playerHasAd = Boolean(
-      player &&
-        player.classList &&
-        (player.classList.contains("ad-showing") || player.classList.contains("ad-interrupting")),
-    );
-    const dataHasAd = Boolean(videoData.isAd || videoData.is_ad);
-    const adPlaying = playerHasAd || dataHasAd;
-    // Ad video data can identify the advertiser. Hiding channel identity while
-    // the ad runs prevents it from looking like a content-channel navigation.
-    const channel = adPlaying ? null : contentChannel;
+    const channel = contentChannel;
     const playbackRate = finiteNumber(video.playbackRate, 1);
     const hasCurrentData = finiteNumber(video.readyState) >= 2;
-    const progressAllowed = Boolean(channel && !adPlaying && !video.seeking);
+    const progressAllowed = Boolean(channel && !video.seeking);
     const eligible = Boolean(
       progressAllowed && !video.paused && !video.ended && hasCurrentData && playbackRate > 0,
     );
     const mediaKey = normalizedText(
-      videoData.video_id ||
+      expectedVideoId ||
+        videoData.video_id ||
         videoData.videoId ||
-        expectedVideoId ||
         video.currentSrc ||
         `${location.pathname}:${location.search}`,
     );
@@ -1065,6 +1390,7 @@ function makeDescription(channel) {
           if (authBlock && authBlock.fingerprint === fingerprint) return;
           if (authBlock) this.store.delete(AUTH_BLOCK_KEY);
 
+          let claimMisses = 0;
           while (true) {
             const nowMs = Date.now();
             if (nowMs >= drainDeadlineMs) return;
@@ -1127,7 +1453,12 @@ function makeDescription(channel) {
             // page dies in that tiny interval, do not POST until recovery has
             // completed the same deterministic local commit.
             if (awaitingLocalCommit) return;
-            if (!claimed) continue;
+            if (!claimed) {
+              claimMisses += 1;
+              if (claimMisses >= 3) return;
+              continue;
+            }
+            claimMisses = 0;
 
             const attempts = rollingAttemptWindow(
               this.store.get(ATTEMPTS_KEY, []),
@@ -1206,6 +1537,7 @@ function makeDescription(channel) {
         button { border: 1px solid #545454; border-radius: 7px; background: #252525; color: inherit;
           padding: 7px 10px; cursor: pointer; font: inherit; }
         button:hover { background: #343434; }
+        button:disabled { cursor: default; opacity: 0.55; }
         button.danger { color: #ffaaaa; }
         #summary { display: block; margin-left: auto; border-radius: 999px; background: #171717;
           box-shadow: 0 2px 12px #0008; }
@@ -1301,11 +1633,12 @@ function makeDescription(channel) {
       this.render();
     }
 
-    makeAction(label, callback, danger = false) {
+    makeAction(label, callback, danger = false, disabled = false) {
       const button = document.createElement("button");
       button.type = "button";
       button.textContent = label;
       if (danger) button.className = "danger";
+      button.disabled = disabled;
       button.addEventListener("click", callback);
       return button;
     }
@@ -1321,7 +1654,10 @@ function makeDescription(channel) {
       const storedErrors = this.app.store.get(ERRORS_KEY, []);
       const errors = Array.isArray(storedErrors) ? storedErrors : [];
       const configErrors = validateConfig(this.app.config);
-      const issueCount = decisions.length + configErrors.length + errors.length;
+      const carryTransferProblem = this.app.getCarryTransferIssue();
+      const identityPending = !this.app.identityResolved;
+      const issueCount =
+        decisions.length + configErrors.length + errors.length + (carryTransferProblem ? 1 : 0);
 
       this.shadow.getElementById("current").textContent = record.active
         ? `${formatDuration(currentMs)} · ${record.active.channel.name || record.active.channel.id}`
@@ -1331,6 +1667,7 @@ function makeDescription(channel) {
       this.shadow.getElementById("issues").textContent = String(issueCount);
       this.summary.textContent = `YT → Toggl ${formatDuration(currentMs)} · Q${queue.length}`;
       this.summary.dataset.state = issueCount ? "issue" : record.active ? "active" : "idle";
+      if (!this.expanded) return;
 
       const configBox = this.shadow.getElementById("config");
       configBox.replaceChildren();
@@ -1343,9 +1680,38 @@ function makeDescription(channel) {
 
       const discardCurrent = this.shadow.getElementById("discard-current");
       discardCurrent.hidden = carryMs <= 0;
+      discardCurrent.disabled = identityPending;
+      this.shadow.getElementById("sync").disabled = identityPending;
 
       const orphanBox = this.shadow.getElementById("orphans");
       orphanBox.replaceChildren();
+      if (carryTransferProblem) {
+        const heading = document.createElement("h3");
+        heading.textContent = "Unreadable carry transfer";
+        const item = document.createElement("div");
+        item.className = "item";
+        const text = document.createElement("p");
+        text.textContent =
+          carryTransferProblem.kind === "unsupported-schema"
+            ? "This transfer was saved by an unsupported script version. Update and reload every YouTube tab before discarding it."
+            : "This saved transfer is malformed and cannot be recovered automatically.";
+        const meta = document.createElement("p");
+        meta.className = "meta";
+        meta.textContent =
+          "Tracking continues. Discarding removes only the journal; carry already written to tab records remains, so ownership may be ambiguous.";
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        actions.append(
+          this.makeAction(
+            "Discard saved transfer",
+            () => this.app.discardUnreadableCarryTransfer(carryTransferProblem.fingerprint),
+            true,
+            identityPending,
+          ),
+        );
+        item.append(text, meta, actions);
+        orphanBox.append(heading, item);
+      }
       const orphans = this.app.getStaleCarryRecords();
       if (orphans.length) {
         const heading = document.createElement("h3");
@@ -1359,8 +1725,18 @@ function makeDescription(channel) {
           const actions = document.createElement("div");
           actions.className = "actions";
           actions.append(
-            this.makeAction("Attach to this tab", () => this.app.attachStaleCarry(orphan.tabId)),
-            this.makeAction("Discard", () => this.app.discardStaleCarry(orphan.tabId), true),
+            this.makeAction(
+              "Attach to this tab",
+              () => this.app.attachStaleCarry(orphan.tabId),
+              false,
+              identityPending,
+            ),
+            this.makeAction(
+              "Discard",
+              () => this.app.discardStaleCarry(orphan.tabId),
+              true,
+              identityPending,
+            ),
           );
           item.append(text, actions);
           orphanBox.appendChild(item);
@@ -1413,9 +1789,14 @@ function makeDescription(channel) {
       this.store = new GMStore();
       this.queue = new SharedQueue(this.store);
       this.worker = new TogglWorker(this.store, this.queue, config);
-      this.tabId = getOrCreateTabId();
+      const tabIdentity = getOrCreateTabIdentity();
+      this.tabId = tabIdentity.tabId;
+      this.reusedTabId = tabIdentity.reused;
+      this.identityResolved = false;
+      this.identityGeneration = 0;
       this.instanceId = randomId("instance");
       this.sample = null;
+      this.inactivityDeadline = null;
       this.discontinuityToken = 0;
       this.lastPageUrl = location.href;
       this.operation = Promise.resolve();
@@ -1424,11 +1805,17 @@ function makeDescription(channel) {
       this.instanceChannel = null;
       this.probeWaiters = new Map();
       this.openInstanceChannel();
+      this.openStorageProbeListener();
     }
 
     openInstanceChannel() {
       if (this.instanceChannel || typeof BroadcastChannel === "undefined") return;
-      this.instanceChannel = new BroadcastChannel("yt-toggl:instances:v1");
+      try {
+        this.instanceChannel = new BroadcastChannel("yt-toggl:instances:v1");
+      } catch (_error) {
+        this.instanceChannel = null;
+        return;
+      }
       this.instanceChannel.addEventListener("message", (event) => {
         const message = event.data;
         if (!message || typeof message !== "object") return;
@@ -1437,12 +1824,7 @@ function makeDescription(channel) {
           message.tabId === this.tabId &&
           message.requesterId !== this.instanceId
         ) {
-          this.instanceChannel.postMessage({
-            type: "alive",
-            probeId: message.probeId,
-            targetId: message.requesterId,
-            responderId: this.instanceId,
-          });
+          this.respondToInstanceProbe(message);
         }
         if (message.type === "alive" && message.targetId === this.instanceId) {
           const resolve = this.probeWaiters.get(message.probeId);
@@ -1451,43 +1833,261 @@ function makeDescription(channel) {
       });
     }
 
-    async resolveDuplicatedTabId() {
-      if (!this.instanceChannel) return;
-      const existing = this.getOwnRecord();
-      if (
-        !existing.instanceId ||
-        existing.instanceId === this.instanceId ||
-        Date.now() - existing.heartbeatMs >= inactivityMs(this.config)
-      ) {
-        return;
+    closeInstanceChannel() {
+      const channel = this.instanceChannel;
+      this.instanceChannel = null;
+      if (!channel) return;
+      try {
+        channel.close();
+      } catch (_error) {
+        // The channel is already unusable.
       }
+    }
 
+    resetInstanceChannel() {
+      this.closeInstanceChannel();
+      this.openInstanceChannel();
+    }
+
+    captureIdentity() {
+      if (this.identityResolved === false) return null;
+      return { tabId: this.tabId, generation: this.identityGeneration };
+    }
+
+    identityMatches(identity) {
+      return Boolean(
+        identity &&
+          this.identityResolved !== false &&
+          identity.tabId === this.tabId &&
+          identity.generation === this.identityGeneration,
+      );
+    }
+
+    markIdentityResolved(identity) {
+      if (
+        !identity ||
+        identity.tabId !== this.tabId ||
+        identity.generation !== this.identityGeneration ||
+        this.reusedTabId
+      ) {
+        return false;
+      }
+      this.identityResolved = true;
+      return true;
+    }
+
+    respondToInstanceProbe(message) {
+      const response = {
+        type: "alive",
+        probeId: message.probeId,
+        targetId: message.requesterId,
+        responderId: this.instanceId,
+      };
+      if (this.instanceChannel) {
+        try {
+          this.instanceChannel.postMessage(response);
+        } catch (_error) {
+          this.resetInstanceChannel();
+          try {
+            if (this.instanceChannel) this.instanceChannel.postMessage(response);
+          } catch (_retryError) {
+            this.resetInstanceChannel();
+          }
+        }
+      }
+      try {
+        this.store.set(INSTANCE_PROBE_KEY, response);
+      } catch (_storageError) {
+        // The BroadcastChannel response above is sufficient when available.
+      }
+    }
+
+    openStorageProbeListener() {
+      if (typeof GM_addValueChangeListener !== "function") return;
+      GM_addValueChangeListener(INSTANCE_PROBE_KEY, (_name, _oldValue, message) => {
+        if (!message || typeof message !== "object") return;
+        if (
+          message.type === "probe" &&
+          message.tabId === this.tabId &&
+          message.requesterId !== this.instanceId
+        ) {
+          this.respondToInstanceProbe(message);
+        }
+        if (message.type === "alive" && message.targetId === this.instanceId) {
+          const resolve = this.probeWaiters.get(message.probeId);
+          if (resolve) resolve(true);
+        }
+      });
+    }
+
+    async resolveDuplicatedTabId(expectedGeneration = this.identityGeneration) {
+      const resolutionGeneration = nonNegativeNumber(expectedGeneration);
+      if (nonNegativeNumber(this.identityGeneration) !== resolutionGeneration) return null;
+      if (!this.reusedTabId) {
+        return { tabId: this.tabId, generation: this.identityGeneration };
+      }
+      const candidateTabId = this.tabId;
+      let resolvedIdentity = null;
+      await withCrossTabLock(this.store, `identity:${candidateTabId}`, async () => {
+        if (
+          nonNegativeNumber(this.identityGeneration) !== resolutionGeneration ||
+          !this.reusedTabId ||
+          this.tabId !== candidateTabId
+        ) {
+          return;
+        }
+        const answers = await Promise.all([
+          this.probeTab(candidateTabId),
+          this.probeTab(candidateTabId, 750),
+        ]);
+        if (
+          nonNegativeNumber(this.identityGeneration) !== resolutionGeneration ||
+          !this.reusedTabId ||
+          this.tabId !== candidateTabId
+        ) {
+          return;
+        }
+        let answered = false;
+        if (answers.some(Boolean)) answered = true;
+        else if (answers.every((answer) => answer === null)) answered = null;
+        // A definite no-response means this is a reload. If transport itself is
+        // unavailable, isolate the page rather than risk two live tabs sharing ID.
+        if (answered === false) {
+          this.reusedTabId = false;
+          resolvedIdentity = {
+            tabId: this.tabId,
+            generation: this.identityGeneration,
+          };
+          return;
+        }
+
+        this.tabId = randomId("tab");
+        this.identityGeneration = resolutionGeneration + 1;
+        this.reusedTabId = false;
+        this.sample = null;
+        this.inactivityDeadline = null;
+        try {
+          sessionStorage.setItem(TAB_ID_SESSION_KEY, this.tabId);
+        } catch (_error) {
+          // The in-memory ID still keeps this live duplicate independent.
+        }
+        resolvedIdentity = {
+          tabId: this.tabId,
+          generation: this.identityGeneration,
+        };
+      });
+      return resolvedIdentity;
+    }
+
+    probeTab(tabId, timeoutMs = 300) {
+      const targetTabId = normalizedText(tabId);
+      // true: live response; false: sent but unanswered; null: could not send.
+      if (!targetTabId) return Promise.resolve(null);
       const probeId = randomId("probe");
-      const answered = await new Promise((resolve) => {
+      return new Promise((resolve) => {
         const timeout = setTimeout(() => {
           this.probeWaiters.delete(probeId);
           resolve(false);
-        }, 300);
+        }, timeoutMs);
         this.probeWaiters.set(probeId, (value) => {
           clearTimeout(timeout);
           this.probeWaiters.delete(probeId);
-          resolve(value);
+          resolve(Boolean(value));
         });
-        this.instanceChannel.postMessage({
+        const message = {
           type: "probe",
           probeId,
-          tabId: this.tabId,
+          tabId: targetTabId,
           requesterId: this.instanceId,
-        });
+        };
+        const sendChannelProbe = () => {
+          if (!this.instanceChannel) return false;
+          try {
+            this.instanceChannel.postMessage(message);
+            return true;
+          } catch (_error) {
+            return false;
+          }
+        };
+        let sent = sendChannelProbe();
+        if (this.instanceChannel && !sent) {
+          this.resetInstanceChannel();
+          sent = sendChannelProbe();
+        }
+        if (this.instanceChannel && !sent) {
+          this.resetInstanceChannel();
+        }
+        try {
+          this.store.set(INSTANCE_PROBE_KEY, message);
+          sent = true;
+        } catch (_storageError) {
+          // A working BroadcastChannel remains sufficient.
+        }
+        if (!sent) {
+          if (this.instanceChannel) this.resetInstanceChannel();
+          clearTimeout(timeout);
+          this.probeWaiters.delete(probeId);
+          resolve(null);
+        }
       });
-      if (!answered) return;
+    }
 
-      this.tabId = randomId("tab");
-      try {
-        sessionStorage.setItem(TAB_ID_SESSION_KEY, this.tabId);
-      } catch (_error) {
-        // The in-memory ID still keeps this live duplicate independent.
+    async probeTabs(tabIds) {
+      const probeOnce = async (ids) =>
+        Promise.all(ids.map(async (tabId) => [tabId, await this.probeTab(tabId)]));
+      const candidates = [...new Set(tabIds)];
+      const firstResults = await probeOnce(candidates);
+      const live = new Set(
+        firstResults.filter(([_tabId, alive]) => alive).map(([tabId]) => tabId),
+      );
+      const indeterminate = new Set(
+        firstResults.filter(([_tabId, alive]) => alive === null).map(([tabId]) => tabId),
+      );
+      const missed = candidates.filter(
+        (tabId) => !live.has(tabId) && !indeterminate.has(tabId),
+      );
+      if (missed.length) {
+        const secondResults = await probeOnce(missed);
+        for (const [tabId, alive] of secondResults) {
+          if (alive) live.add(tabId);
+          else if (alive === null) indeterminate.add(tabId);
+        }
       }
+      return { live, indeterminate };
+    }
+
+    recordNeedsProbe(record, nowMs) {
+      if (
+        record.tabId === this.tabId ||
+        !record.instanceId ||
+        nowMs - record.heartbeatMs < TAB_HEARTBEAT_GRACE_MS
+      ) {
+        return false;
+      }
+      return Boolean(
+        (record.active &&
+          nowMs - record.active.lastEligibleAtMs >= inactivityMs(this.config)) ||
+          (!record.active &&
+            carryDurationMs(record.carry) === 0 &&
+            nowMs - record.heartbeatMs >= inactivityMs(this.config)),
+      );
+    }
+
+    probeSubject(record) {
+      return {
+        instanceId: record.instanceId,
+        heartbeatMs: record.heartbeatMs,
+        activeId: record.active ? record.active.id : "",
+      };
+    }
+
+    probeSubjectMatches(record, subject) {
+      return Boolean(
+        subject &&
+          subject.instanceId === record.instanceId &&
+          subject.heartbeatMs === record.heartbeatMs &&
+          subject.activeId === (record.active ? record.active.id : ""),
+      );
     }
 
     getOwnRecord() {
@@ -1516,6 +2116,17 @@ function makeDescription(channel) {
       );
     }
 
+    getCarryTransferIssue() {
+      return carryTransferIssue(this.store.get(CARRY_TRANSFER_KEY, null));
+    }
+
+    withTabsLock(callback) {
+      return withCrossTabLock(this.store, "tabs", () => {
+        completeCarryTransfer(this.store);
+        return callback();
+      });
+    }
+
     enqueueOperation(callback) {
       this.operation = this.operation
         .then(callback)
@@ -1527,67 +2138,154 @@ function makeDescription(channel) {
       return this.operation;
     }
 
-    async commitMachine(machine, entries, nowMs, commandId = "") {
-      if (entries.length) await this.queue.add(entries);
+    async addEntriesForIdentity(entries, identity) {
+      if (!this.identityMatches(identity)) return false;
+      if (!entries.length) return true;
+      const existingIds = new Set(this.queue.get().map((entry) => entry.id));
+      await this.queue.add(entries);
+      if (this.identityMatches(identity)) return true;
+      for (const entry of entries) {
+        if (!existingIds.has(entry.id)) await this.queue.remove(entry.id);
+      }
+      return false;
+    }
+
+    async commitMachine(machine, entries, nowMs, commandId = "", identity = this.captureIdentity()) {
+      if (!(await this.addEntriesForIdentity(entries, identity))) return false;
+      if (!this.identityMatches(identity)) return false;
       machine.record.heartbeatMs = nowMs;
       machine.record.instanceId = this.instanceId;
       if (commandId) machine.record.lastCommandId = commandId;
       this.store.set(tabStorageKey(this.tabId), machine.record);
       this.sample = machine.sample;
+      this.inactivityDeadline = machine.inactivityDeadline;
       if (entries.length) this.worker.kick();
+      return true;
     }
 
     tick() {
-      return this.enqueueOperation(() =>
-        withCrossTabLock(this.store, "tabs", async () => {
+      return this.enqueueOperation(() => {
+        const identity = this.captureIdentity();
+        if (!identity) return undefined;
+        return this.withTabsLock(async () => {
+          if (!this.identityMatches(identity)) return;
           const snapshot = discoverMedia(this.discontinuityToken);
           const machine = new SessionMachine(this.config, this.getOwnRecord());
           machine.sample = this.sample;
+          machine.inactivityDeadline = this.inactivityDeadline;
           const entries = machine.tick(snapshot);
-          await this.commitMachine(machine, entries, snapshot.nowMs);
-        }),
-      );
+          await this.commitMachine(machine, entries, snapshot.nowMs, "", identity);
+        });
+      });
     }
 
     handleSync(commandId) {
-      return this.enqueueOperation(() =>
-        withCrossTabLock(this.store, "tabs", async () => {
+      return this.enqueueOperation(() => {
+        const identity = this.captureIdentity();
+        if (!identity) return undefined;
+        return this.withTabsLock(async () => {
+          if (!this.identityMatches(identity)) return;
           const record = this.getOwnRecord();
           if (record.lastCommandId === commandId) return;
           const snapshot = discoverMedia(this.discontinuityToken);
           const machine = new SessionMachine(this.config, record);
           machine.sample = this.sample;
+          machine.inactivityDeadline = this.inactivityDeadline;
           const entries = machine.sync(snapshot);
-          await this.commitMachine(machine, entries, snapshot.nowMs, commandId);
-          this.worker.kick();
-        }),
-      );
+          const committed = await this.commitMachine(
+            machine,
+            entries,
+            snapshot.nowMs,
+            commandId,
+            identity,
+          );
+          if (committed) this.worker.kick();
+        });
+      });
     }
 
     broadcastSync() {
-      const command = { id: randomId("sync"), type: "sync", fromTabId: this.tabId, atMs: Date.now() };
+      const identity = this.captureIdentity();
+      if (!identity) return;
+      const command = {
+        id: randomId("sync"),
+        type: "sync",
+        fromTabId: identity.tabId,
+        atMs: Date.now(),
+      };
       this.store.set(COMMAND_KEY, command);
       this.handleSync(command.id);
     }
 
     async recoverTabs() {
-      await withCrossTabLock(this.store, "tabs", async () => {
+      const identity = this.captureIdentity();
+      if (!identity) return;
+      const probeAtMs = Date.now();
+      const probeSubjects = new Map(
+        this.getAllTabRecords()
+          .filter((record) => this.recordNeedsProbe(record, probeAtMs))
+          .map((record) => [record.tabId, this.probeSubject(record)]),
+      );
+      const foreignProbe = await this.probeTabs([...probeSubjects.keys()]);
+      if (!this.identityMatches(identity)) return;
+
+      await this.withTabsLock(async () => {
+        if (!this.identityMatches(identity)) return;
         const nowMs = Date.now();
         const entries = [];
         const updates = [];
-        for (const record of this.getAllTabRecords()) {
-          const result = recoverExpiredRecord(record, nowMs, this.config, makeDescription);
+        const deletions = [];
+        const records = this.getAllTabRecords();
+        const freshForeignTabs = new Set(
+          records
+            .filter(
+              (record) =>
+                record.tabId !== this.tabId &&
+                nowMs - record.heartbeatMs < TAB_HEARTBEAT_GRACE_MS,
+            )
+            .map((record) => record.tabId),
+        );
+
+        for (const record of records) {
+          const liveOwnSession = Boolean(
+            record.tabId === this.tabId &&
+              record.active &&
+              this.inactivityDeadline &&
+              this.inactivityDeadline.sessionId === record.active.id,
+          );
+          const needsProbe = this.recordNeedsProbe(record, nowMs);
+          const deferUnverifiedRecord =
+            needsProbe && !this.probeSubjectMatches(record, probeSubjects.get(record.tabId));
+          const recordIsLive =
+            liveOwnSession ||
+            freshForeignTabs.has(record.tabId) ||
+            foreignProbe.live.has(record.tabId) ||
+            // Failed transport cannot establish that destructive recovery is safe.
+            foreignProbe.indeterminate.has(record.tabId) ||
+            // The in-lock record is authoritative. Defer anything that became
+            // probe-eligible or changed ownership while probes were in flight.
+            deferUnverifiedRecord;
+          const result = recordIsLive
+            ? { record, entry: null, disposition: "unchanged" }
+            : recoverExpiredRecord(record, nowMs, this.config, makeDescription);
           if (result.entry) entries.push(result.entry);
           if (result.disposition !== "unchanged") {
             // Keep the old heartbeat so recovered carry remains visibly stale.
             result.record.heartbeatMs = record.heartbeatMs;
-            updates.push(result.record);
+          }
+          const nextRecord = result.disposition === "unchanged" ? record : result.record;
+          if (!recordIsLive && tabRecordIsPrunable(nextRecord, this.tabId, nowMs, this.config)) {
+            deletions.push(nextRecord.tabId);
+          } else if (result.disposition !== "unchanged") {
+            updates.push(nextRecord);
           }
         }
         // Queue first. Deterministic entry IDs make a retry harmless if the
         // page closes before the corresponding tab-record updates complete.
-        if (entries.length) await this.queue.add(entries);
+        if (!(await this.addEntriesForIdentity(entries, identity))) return;
+        if (!this.identityMatches(identity)) return;
         for (const record of updates) this.store.set(tabStorageKey(record.tabId), record);
+        for (const tabId of deletions) this.store.delete(tabStorageKey(tabId));
 
         const own = this.getOwnRecord();
         own.heartbeatMs = nowMs;
@@ -1597,8 +2295,12 @@ function makeDescription(channel) {
     }
 
     attachStaleCarry(sourceTabId) {
-      return this.enqueueOperation(() =>
-        withCrossTabLock(this.store, "tabs", () => {
+      const identity = this.captureIdentity();
+      if (!identity) return;
+      return this.enqueueOperation(() => {
+        if (!this.identityMatches(identity)) return undefined;
+        return this.withTabsLock(() => {
+          if (!this.identityMatches(identity)) return;
           const nowMs = Date.now();
           const source = normalizeTabRecord(
             this.store.get(tabStorageKey(sourceTabId), createTabRecord(sourceTabId)),
@@ -1611,19 +2313,25 @@ function makeDescription(channel) {
           if (source.active) {
             throw new Error("That tab's expired session is still being recovered; try again shortly.");
           }
-          const result = attachCarry(this.getOwnRecord(), source, nowMs);
-          result.target.heartbeatMs = nowMs;
-          result.target.instanceId = this.instanceId;
-          this.store.set(tabStorageKey(this.tabId), result.target);
-          this.store.set(tabStorageKey(sourceTabId), result.source);
-        }),
-      );
+          const transfer = createCarryTransfer(source, identity.tabId, this.instanceId, nowMs);
+          if (transfer) {
+            const result = beginCarryTransfer(this.store, transfer);
+            if (result && tabRecordIsPrunable(result.source, identity.tabId, nowMs, this.config)) {
+              this.store.delete(tabStorageKey(result.source.tabId));
+            }
+          }
+        });
+      });
     }
 
     discardStaleCarry(sourceTabId) {
+      const identity = this.captureIdentity();
+      if (!identity) return;
       if (!window.confirm("Permanently discard this stale tab's carried watch time?")) return;
-      return this.enqueueOperation(() =>
-        withCrossTabLock(this.store, "tabs", () => {
+      return this.enqueueOperation(() => {
+        if (!this.identityMatches(identity)) return undefined;
+        return this.withTabsLock(() => {
+          if (!this.identityMatches(identity)) return;
           const nowMs = Date.now();
           const source = normalizeTabRecord(
             this.store.get(tabStorageKey(sourceTabId), createTabRecord(sourceTabId)),
@@ -1636,21 +2344,44 @@ function makeDescription(channel) {
           if (source.active) {
             throw new Error("That tab's expired session is still being recovered; try again shortly.");
           }
-          this.store.set(tabStorageKey(sourceTabId), discardCarry(source, nowMs));
-        }),
-      );
+          this.store.delete(tabStorageKey(sourceTabId));
+        });
+      });
     }
 
     discardCurrentCarry() {
+      const identity = this.captureIdentity();
+      if (!identity) return;
       if (!window.confirm("Permanently discard this tab's carried watch time?")) return;
-      return this.enqueueOperation(() =>
-        withCrossTabLock(this.store, "tabs", () => {
+      return this.enqueueOperation(() => {
+        if (!this.identityMatches(identity)) return undefined;
+        return this.withTabsLock(() => {
+          if (!this.identityMatches(identity)) return;
           const next = discardCarry(this.getOwnRecord());
           next.heartbeatMs = Date.now();
           next.instanceId = this.instanceId;
-          this.store.set(tabStorageKey(this.tabId), next);
-        }),
-      );
+          this.store.set(tabStorageKey(identity.tabId), next);
+        });
+      });
+    }
+
+    discardUnreadableCarryTransfer(fingerprint) {
+      const identity = this.captureIdentity();
+      if (!identity) return;
+      if (
+        !window.confirm(
+          "Discard only the unreadable carry-transfer journal? Existing tab carry will be preserved, but ownership may remain ambiguous.",
+        )
+      ) {
+        return;
+      }
+      return this.enqueueOperation(() => {
+        if (!this.identityMatches(identity)) return undefined;
+        return this.withTabsLock(() => {
+          if (!this.identityMatches(identity)) return;
+          return discardCarryTransferJournal(this.store, fingerprint);
+        });
+      });
     }
 
     retryEntry(entryId) {
@@ -1660,7 +2391,6 @@ function makeDescription(channel) {
           nextAttemptAtMs: 0,
           sendingSinceMs: 0,
           lastError: "",
-          explicitRetryAtMs: Date.now(),
         }));
         this.store.delete(AUTH_BLOCK_KEY);
         this.worker.kick();
@@ -1719,17 +2449,29 @@ function makeDescription(channel) {
       });
 
       window.addEventListener("pagehide", () => {
-        if (this.instanceChannel) this.instanceChannel.close();
-        this.instanceChannel = null;
+        this.closeInstanceChannel();
       });
       window.addEventListener("pageshow", (event) => {
-        if (event.persisted) this.openInstanceChannel();
+        if (!event.persisted) return;
+        this.openInstanceChannel();
+        this.reusedTabId = true;
+        this.identityGeneration = nonNegativeNumber(this.identityGeneration) + 1;
+        const restoreGeneration = this.identityGeneration;
+        this.identityResolved = false;
+        this.status.render();
+        this.enqueueOperation(async () => {
+          const identity = await this.resolveDuplicatedTabId(restoreGeneration);
+          this.markIdentityResolved(identity);
+        });
+        this.tick();
       });
     }
 
     async start() {
-      await this.resolveDuplicatedTabId();
       this.status.mount();
+      const identity = await this.resolveDuplicatedTabId(this.identityGeneration);
+      if (!this.markIdentityResolved(identity)) return;
+      this.status.render();
       await this.recoverTabs();
       this.bindEvents();
       await this.tick();
@@ -1745,22 +2487,29 @@ function makeDescription(channel) {
           WORKER_INTERVAL_MS,
         ),
       );
-      this.intervals.push(setInterval(() => this.status.render(), TICK_INTERVAL_MS));
     }
   }
 
   const API = {
     CONFIG,
+    BrowserApp,
     SessionMachine,
+    TogglWorker,
     attachCarry,
+    beginCarryTransfer,
     buildTogglRequest,
     carryDurationMs,
+    carryTransferIssue,
     channelFromVideoData,
     channelsEqual,
     classifyAttempt,
+    completeCarryTransfer,
     configFingerprint,
+    createCarryTransfer,
     createTabRecord,
     discardCarry,
+    discardCarryTransferJournal,
+    discoverMedia,
     encodeBasicAuth,
     enqueueUnique,
     finalizeTabRecord,
@@ -1770,6 +2519,7 @@ function makeDescription(channel) {
     markInterruptedRequestsUncertain,
     minimumDurationMs,
     normalizeCarry,
+    normalizeCarryTransfer,
     normalizeQueue,
     normalizeSnapshot,
     normalizeTabRecord,
@@ -1779,6 +2529,7 @@ function makeDescription(channel) {
     requestSpacingDelay,
     rollingAttemptWindow,
     selectActiveVideo,
+    tabRecordIsPrunable,
     validatedPlaybackMs,
     validateConfig,
   };
@@ -1788,7 +2539,8 @@ function makeDescription(channel) {
   if (
     typeof window !== "undefined" &&
     typeof document !== "undefined" &&
-    typeof GM_getValue === "function"
+    typeof GM_getValue === "function" &&
+    isTopLevelBrowsingContext()
   ) {
     const app = new BrowserApp(CONFIG);
     app.start().catch((error) => {

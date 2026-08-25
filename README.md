@@ -54,12 +54,14 @@ Changing `mergeBelowMinimum` to `false` does not silently delete carry that alre
 The userscript samples real elapsed time and validates every credited interval against media progress:
 
 - Pauses, seeking, buffering, stalls, ended media, and YouTube-served ads are excluded.
+- Thumbnail hover previews are excluded; only YouTube's primary player surface or active Shorts player is considered.
 - Playback at 2× still contributes one minute for one real minute watched.
 - Background playback counts; page visibility is deliberately not used as an eligibility condition.
 - Long timer delays are capped by validated media progress, and both wall and monotonic clocks are checked so browser or machine suspension does not invent time.
+- A live session closes when either its wall-clock or monotonic inactivity deadline is reached. The wall deadline catches machine suspension on platforms whose monotonic clock pauses; the monotonic deadline prevents a backward clock correction from delaying closure. Delayed media progress keeps the session continuous only when neither clock contains a full inactivity window unexplained by that progress, so throttled background playback remains eligible without letting a brief post-wake advance hide a suspension gap. A large forward wall-clock jump can split a session early because it is indistinguishable from suspension using browser clocks alone.
 - Live streams use the same progress state machine and do not depend on a finite media duration.
 
-The script prefers YouTube's stable channel ID and falls back to the normalized channel name while metadata is loading. A different channel immediately closes the current session. Navigation to another video from the same channel only resets the media-progress baseline and keeps the session open.
+The script prefers YouTube's stable channel ID and falls back to the normalized channel name while metadata is loading. On watch and Shorts routes, playback remains ineligible while the route and player video IDs disagree. A different channel immediately closes the current session. Navigation to another video from the same channel only resets the media-progress baseline and keeps the session open.
 
 ## Minimum-duration behavior
 
@@ -73,15 +75,19 @@ In merge mode, a short finalized session becomes carry owned by that logical tab
 
 For example, 30 seconds from channel A followed by 2 minutes from channel B creates one 150-second entry described as channel B, starting when B began.
 
+Because earlier carry is added to the receiving session's duration, the entry's implied endpoint can be later than the time it was finalized.
+
 ## Status, Sync, and recovery
 
-The lower-right Shadow-DOM control shows current-tab time, current-tab carry, all finalized queue items, and errors or entries that need a decision.
+The lower-right Shadow-DOM control appears only in the top-level YouTube page, not embedded frames such as live chat. It shows current-tab time, current-tab carry, all finalized queue items, and errors or entries that need a decision.
 
 **Sync all tabs** broadcasts through Violentmonkey storage. Every open YouTube tab independently finalizes its current session under the same minimum rule. A player that is still eligible immediately starts a fresh zero-length session. Below-minimum carry remains local and visible.
 
-Each logical tab gets an ID in `sessionStorage`, while active sessions and carry are saved in Violentmonkey storage. Reloading a tab therefore keeps its active session and carry without crediting the reload gap. A closed tab cannot run code; after its inactivity deadline, the next visited YouTube page recovers its saved active session.
+Each logical tab gets an ID in `sessionStorage`, while active sessions and carry are saved in Violentmonkey storage. Reloading a tab therefore keeps its active session and carry without crediting the reload gap. A closed tab cannot run code; after its inactivity deadline, the next visited YouTube page recovers its saved active session when no live owner responds. Fresh heartbeats and cross-tab probes prevent a wall-clock jump from recovering a live tab, and an unavailable probe transport defers destructive recovery.
 
-Carry from a permanently closed tab is never silently merged into another tab. Once stale, it appears under **Stale tab carry** with explicit **Attach to this tab** and **Discard** actions. Attachments use per-part IDs, so an interrupted attachment cannot count a carry part twice.
+Carry from a permanently closed tab is never silently merged into another tab. Once stale, it appears under **Stale tab carry** with explicit **Attach to this tab** and **Discard** actions. Attachments first persist a transfer journal and use per-part IDs; recovery completes the designated target after an interruption without duplicating or losing carry.
+
+If a transfer journal is malformed or was written by an unsupported script version, ordinary tracking continues and the status panel shows **Unreadable carry transfer**. Update and reload all YouTube tabs first when versions differ. The explicit discard action removes only the matching journal and preserves every saved tab record; because an interrupted transfer may already have written carry to more than one record, ownership can remain ambiguous after that discard.
 
 ## Toggl delivery and failures
 
@@ -119,4 +125,4 @@ Node 18 or newer is sufficient; there are no packages to install.
 npm test
 ```
 
-The tests exercise session boundaries, carry/discard behavior, tab isolation, navigation, playback speed, seeks, stalls, ads, live/Shorts behavior, global Sync, reload and stale-session recovery, request spacing and quota exhaustion, request payloads, authentication failures, and uncertain POST outcomes. They do not contact YouTube or Toggl.
+The tests exercise session boundaries, suspension and clock corrections, crash-safe and unreadable carry transfer, carry/discard behavior, tab isolation and cleanup, route/player navigation races, playback speed, seeks, stalls, ads, live/Shorts behavior, collapsed status rendering, global Sync, reload and stale-session recovery, request spacing and quota exhaustion, request payloads, authentication failures, and uncertain POST outcomes. They do not contact YouTube or Toggl.

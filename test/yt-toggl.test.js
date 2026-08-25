@@ -6,16 +6,23 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 
 const {
+  BrowserApp,
   SessionMachine,
+  TogglWorker,
   attachCarry,
+  beginCarryTransfer,
   buildTogglRequest,
   carryDurationMs,
+  carryTransferIssue,
   channelFromVideoData,
   channelsEqual,
   classifyAttempt,
+  completeCarryTransfer,
   configFingerprint,
+  createCarryTransfer,
   createTabRecord,
   discardCarry,
+  discardCarryTransferJournal,
   encodeBasicAuth,
   enqueueUnique,
   finalizeTabRecord,
@@ -26,6 +33,7 @@ const {
   requestSpacingDelay,
   rollingAttemptWindow,
   selectActiveVideo,
+  tabRecordIsPrunable,
   validateConfig,
   validatedPlaybackMs,
 } = require("../yt-toggl.user.js");
@@ -70,6 +78,39 @@ function snapshot(nowMs, mediaTime, overrides = {}) {
 function idFactory(seed = "test") {
   let sequence = 0;
   return (prefix) => `${seed}-${prefix}-${++sequence}`;
+}
+
+function faultingStore(initialValues = {}) {
+  const values = new Map(
+    Object.entries(initialValues).map(([key, value]) => [key, JSON.parse(JSON.stringify(value))]),
+  );
+  let remainingMutations = null;
+  const mutate = (callback) => {
+    if (remainingMutations === 0) throw new Error("simulated storage interruption");
+    if (remainingMutations !== null) remainingMutations -= 1;
+    callback();
+  };
+  return {
+    values,
+    arm(successfulMutationsBeforeFailure) {
+      remainingMutations = successfulMutationsBeforeFailure;
+    },
+    disarm() {
+      remainingMutations = null;
+    },
+    get(key, fallback) {
+      return JSON.parse(JSON.stringify(values.has(key) ? values.get(key) : fallback));
+    },
+    keys() {
+      return [...values.keys()];
+    },
+    set(key, value) {
+      mutate(() => values.set(key, JSON.parse(JSON.stringify(value))));
+    },
+    delete(key) {
+      mutate(() => values.delete(key));
+    },
+  };
 }
 
 function machine(overrides = {}, tabId = "tab-1") {
@@ -119,6 +160,320 @@ test("inactivity finalizes at exactly the configured boundary, not before", () =
   assert.equal(entries.length, 1);
   assert.equal(entries[0].reason, "inactivity");
   assert.equal(entries[0].duration, 60);
+});
+
+test("machine suspension closes an inactive session before resumed playback", () => {
+  const tracker = machine({ minimumDurationMinutes: 0 });
+  tracker.tick(snapshot(0, 0, { monotonicMs: 0 }));
+  tracker.tick(snapshot(5 * MINUTE, 5 * 60, { monotonicMs: 5 * MINUTE }));
+  tracker.tick(
+    snapshot(5 * MINUTE, 5 * 60, {
+      monotonicMs: 5 * MINUTE,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+  const wakeMs = 3 * 60 * MINUTE + 5 * MINUTE;
+  const wakeEntries = tracker.tick(
+    snapshot(wakeMs, 5 * 60, { monotonicMs: 5 * MINUTE }),
+  );
+  assert.equal(wakeEntries.length, 1);
+  assert.equal(wakeEntries[0].reason, "inactivity");
+  assert.equal(wakeEntries[0].duration, 5 * 60);
+
+  tracker.tick(
+    snapshot(wakeMs + 2 * MINUTE, 7 * 60, { monotonicMs: 7 * MINUTE }),
+  );
+  const resumedEntries = finish(tracker, wakeMs + 2 * MINUTE, 7 * 60, {
+    monotonicMs: 7 * MINUTE,
+  });
+  assert.equal(resumedEntries.length, 1);
+  assert.equal(resumedEntries[0].duration, 2 * 60);
+  assert.equal(resumedEntries[0].start, new Date(wakeMs).toISOString());
+});
+
+test("machine suspension closes a playing session before post-wake progress", () => {
+  const tracker = machine({ minimumDurationMinutes: 0 });
+  tracker.tick(snapshot(0, 0, { monotonicMs: 0 }));
+  tracker.tick(snapshot(5 * MINUTE, 5 * 60, { monotonicMs: 5 * MINUTE }));
+
+  const wakeMs = 3 * 60 * MINUTE + 5 * MINUTE + SECOND;
+  const wakeEntries = tracker.tick(
+    snapshot(wakeMs, 5 * 60 + 1, { monotonicMs: 5 * MINUTE + SECOND }),
+  );
+  assert.equal(wakeEntries.length, 1);
+  assert.equal(wakeEntries[0].reason, "inactivity");
+  assert.equal(wakeEntries[0].duration, 5 * 60);
+
+  tracker.tick(
+    snapshot(wakeMs + 2 * MINUTE, 7 * 60 + 1, {
+      monotonicMs: 7 * MINUTE + SECOND,
+    }),
+  );
+  const resumedEntries = finish(tracker, wakeMs + 2 * MINUTE, 7 * 60 + 1, {
+    monotonicMs: 7 * MINUTE + SECOND,
+  });
+  assert.equal(resumedEntries.length, 1);
+  assert.equal(resumedEntries[0].duration, 2 * 60 + 1);
+  assert.equal(resumedEntries[0].start, new Date(wakeMs - SECOND).toISOString());
+});
+
+test("the wall inactivity deadline fires at its exact boundary when monotonic time is short", () => {
+  const tracker = machine({ minimumDurationMinutes: 0 });
+  tracker.tick(snapshot(0, 0, { monotonicMs: 0 }));
+  tracker.tick(snapshot(MINUTE, 60, { monotonicMs: MINUTE }));
+  tracker.tick(
+    snapshot(MINUTE, 60, {
+      monotonicMs: MINUTE,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+  assert.deepEqual(
+    tracker.tick(
+      snapshot(11 * MINUTE - 1, 60, {
+        monotonicMs: MINUTE + SECOND,
+        eligible: false,
+        progressAllowed: true,
+      }),
+    ),
+    [],
+  );
+  const entries = tracker.tick(
+    snapshot(11 * MINUTE, 60, {
+      monotonicMs: MINUTE + 2 * SECOND,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].reason, "inactivity");
+});
+
+test("a backward wall correction re-anchors suspension recovery", () => {
+  const tracker = machine({ minimumDurationMinutes: 0 });
+  const initialWallMs = 60 * MINUTE;
+  tracker.tick(snapshot(initialWallMs, 0, { monotonicMs: 0 }));
+  tracker.tick(snapshot(initialWallMs + MINUTE, 60, { monotonicMs: MINUTE }));
+  tracker.tick(
+    snapshot(initialWallMs + MINUTE, 60, {
+      monotonicMs: MINUTE,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+
+  const correctedWallMs = 30 * MINUTE;
+  tracker.tick(
+    snapshot(correctedWallMs, 60, {
+      monotonicMs: MINUTE,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+  assert.deepEqual(
+    tracker.tick(
+      snapshot(correctedWallMs + 10 * MINUTE - 1, 60, {
+        monotonicMs: MINUTE,
+        eligible: false,
+        progressAllowed: true,
+      }),
+    ),
+    [],
+  );
+  const entries = tracker.tick(
+    snapshot(correctedWallMs + 10 * MINUTE, 60, {
+      monotonicMs: MINUTE,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].reason, "inactivity");
+});
+
+test("a recreated deadline re-anchors a persisted timestamp after a backward correction", () => {
+  const record = createTabRecord("recreated-after-correction", 0);
+  record.active = {
+    id: "persisted-session",
+    channel: channel("A"),
+    firstPlayMs: 50 * MINUTE,
+    lastEligibleAtMs: 60 * MINUTE,
+    durationMs: 10 * MINUTE,
+  };
+  let tracker = new SessionMachine(config({ minimumDurationMinutes: 0 }), record);
+  const correctedWallMs = 30 * MINUTE;
+  assert.deepEqual(
+    tracker.tick(
+      snapshot(correctedWallMs, 10 * 60, {
+        monotonicMs: 0,
+        eligible: false,
+        progressAllowed: true,
+      }),
+    ),
+    [],
+  );
+  assert.equal(tracker.record.active.lastEligibleAtMs, correctedWallMs);
+  tracker = new SessionMachine(config({ minimumDurationMinutes: 0 }), tracker.record);
+  assert.deepEqual(
+    tracker.tick(
+      snapshot(correctedWallMs + 5 * MINUTE, 10 * 60, {
+        monotonicMs: 0,
+        eligible: false,
+        progressAllowed: true,
+      }),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    tracker.tick(
+      snapshot(correctedWallMs + 10 * MINUTE - 1, 10 * 60, {
+        monotonicMs: 0,
+        eligible: false,
+        progressAllowed: true,
+      }),
+    ),
+    [],
+  );
+  const entries = tracker.tick(
+    snapshot(correctedWallMs + 10 * MINUTE, 10 * 60, {
+      monotonicMs: 0,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].reason, "inactivity");
+});
+
+test("a backward wall re-anchor survives reload after part of the inactivity period", () => {
+  const initialWallMs = 60 * MINUTE;
+  let tracker = machine({ minimumDurationMinutes: 0 });
+  tracker.tick(snapshot(initialWallMs, 0, { monotonicMs: 0 }));
+  tracker.tick(snapshot(initialWallMs + MINUTE, 60, { monotonicMs: MINUTE }));
+  tracker.tick(
+    snapshot(initialWallMs + MINUTE, 60, {
+      monotonicMs: MINUTE,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+
+  const correctedWallMs = 30 * MINUTE;
+  tracker.tick(
+    snapshot(correctedWallMs, 60, {
+      monotonicMs: MINUTE,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+  assert.equal(tracker.record.active.lastEligibleAtMs, correctedWallMs);
+
+  tracker = new SessionMachine(config({ minimumDurationMinutes: 0 }), tracker.record);
+  assert.deepEqual(
+    tracker.tick(
+      snapshot(correctedWallMs + 5 * MINUTE, 60, {
+        monotonicMs: 0,
+        eligible: false,
+        progressAllowed: true,
+      }),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    tracker.tick(
+      snapshot(correctedWallMs + 10 * MINUTE - 1, 60, {
+        monotonicMs: 0,
+        eligible: false,
+        progressAllowed: true,
+      }),
+    ),
+    [],
+  );
+  const entries = tracker.tick(
+    snapshot(correctedWallMs + 10 * MINUTE, 60, {
+      monotonicMs: 0,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].reason, "inactivity");
+});
+
+test("validated delayed background playback resets both inactivity deadlines", () => {
+  const tracker = machine({ minimumDurationMinutes: 0 });
+  tracker.tick(snapshot(0, 0, { monotonicMs: 0 }));
+  assert.deepEqual(
+    tracker.tick(snapshot(11 * MINUTE, 11 * 60, { monotonicMs: 11 * MINUTE })),
+    [],
+  );
+  const entries = finish(tracker, 11 * MINUTE, 11 * 60, {
+    monotonicMs: 11 * MINUTE,
+  });
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].duration, 11 * 60);
+});
+
+test("delayed progress bridges only gaps shorter than the inactivity boundary", () => {
+  const continuous = machine({ minimumDurationMinutes: 0 }, "continuous-gap");
+  continuous.tick(snapshot(0, 0, { monotonicMs: 0 }));
+  continuous.tick(snapshot(5 * MINUTE, 5 * 60, { monotonicMs: 5 * MINUTE }));
+  assert.deepEqual(
+    continuous.tick(snapshot(16 * MINUTE, 7 * 60, { monotonicMs: 16 * MINUTE })),
+    [],
+  );
+  const continuousEntries = finish(continuous, 16 * MINUTE, 7 * 60, {
+    monotonicMs: 16 * MINUTE,
+  });
+  assert.equal(continuousEntries.length, 1);
+  assert.equal(continuousEntries[0].duration, 7 * 60);
+
+  const expired = machine({ minimumDurationMinutes: 0 }, "expired-gap");
+  expired.tick(snapshot(0, 0, { monotonicMs: 0 }));
+  expired.tick(snapshot(5 * MINUTE, 5 * 60, { monotonicMs: 5 * MINUTE }));
+  const expiredEntries = expired.tick(
+    snapshot(17 * MINUTE, 7 * 60, { monotonicMs: 17 * MINUTE }),
+  );
+  assert.equal(expiredEntries.length, 1);
+  assert.equal(expiredEntries[0].reason, "inactivity");
+  assert.equal(expiredEntries[0].duration, 5 * 60);
+  assert.equal(expired.record.active.durationMs, 2 * MINUTE);
+  assert.equal(expired.record.active.firstPlayMs, 15 * MINUTE);
+});
+
+test("recreated machines preserve a seeded monotonic inactivity deadline", () => {
+  const record = createTabRecord("recreated", 0);
+  record.active = {
+    id: "persisted-session",
+    channel: channel("A"),
+    firstPlayMs: 0,
+    lastEligibleAtMs: 0,
+    durationMs: MINUTE,
+  };
+  let tracker = new SessionMachine(config({ minimumDurationMinutes: 0 }), record);
+  assert.deepEqual(
+    tracker.tick(
+      snapshot(10 * MINUTE - 1, 60, {
+        monotonicMs: 5 * SECOND,
+        eligible: false,
+        progressAllowed: true,
+      }),
+    ),
+    [],
+  );
+  tracker = new SessionMachine(config({ minimumDurationMinutes: 0 }), tracker.record, {
+    inactivityDeadline: tracker.inactivityDeadline,
+  });
+  const entries = tracker.tick(
+    snapshot(0, 60, {
+      monotonicMs: 5 * SECOND + 1,
+      eligible: false,
+      progressAllowed: true,
+    }),
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].reason, "inactivity");
 });
 
 test("a session exactly at the minimum queues while one millisecond below carries", () => {
@@ -228,6 +583,728 @@ test("carry survives serialization and supports explicit attachment and discard"
   assert.equal(carryDurationMs(discardCarry(attached.target).carry), 0);
 });
 
+test("persisted carry transfers recover every interrupted write without duplication or loss", () => {
+  const journalKey = "yt-toggl:carry-transfer:v1";
+  const sourceKey = "yt-toggl:tab:v1:source";
+  const targetKey = "yt-toggl:tab:v1:target";
+
+  for (let cut = 0; cut <= 3; cut += 1) {
+    const source = createTabRecord("source", 0);
+    source.carry = {
+      parts: [{ id: "moved", durationMs: 30 * SECOND, sourceTabId: "source", createdAtMs: 1 }],
+    };
+    const target = createTabRecord("target", 0);
+    target.carry = {
+      parts: [{ id: "existing", durationMs: 5 * SECOND, sourceTabId: "target", createdAtMs: 1 }],
+    };
+    const transfer = createCarryTransfer(source, "target", "target-instance", 100, () => "transfer-1");
+    const store = faultingStore({ [sourceKey]: source, [targetKey]: target });
+    store.arm(cut);
+    assert.throws(
+      () => beginCarryTransfer(store, transfer),
+      /simulated storage interruption/,
+      `cut ${cut} should interrupt the durable sequence`,
+    );
+    store.disarm();
+
+    if (store.values.has(journalKey)) {
+      completeCarryTransfer(store);
+      assert.equal(completeCarryTransfer(store), null, "recovery itself is idempotent");
+    }
+
+    const recoveredSource = store.get(sourceKey, createTabRecord("source", 0));
+    const recoveredTarget = store.get(targetKey, createTabRecord("target", 0));
+    const sourceIds = recoveredSource.carry.parts.map((part) => part.id);
+    const targetIds = recoveredTarget.carry.parts.map((part) => part.id);
+    assert.equal(store.values.has(journalKey), false);
+    assert.equal(targetIds.includes("existing"), true);
+    assert.equal(
+      [...sourceIds, ...targetIds].filter((id) => id === "moved").length,
+      1,
+      `cut ${cut} must leave one global copy`,
+    );
+    assert.equal(targetIds.includes("moved"), cut > 0);
+    assert.equal(sourceIds.includes("moved"), cut === 0);
+  }
+});
+
+test("carry transfer recovery preserves later source state and newer target ownership", () => {
+  const sourceKey = "yt-toggl:tab:v1:source";
+  const targetKey = "yt-toggl:tab:v1:target";
+  const source = createTabRecord("source", 0);
+  source.carry = {
+    parts: [{ id: "moved", durationMs: 30 * SECOND, sourceTabId: "source", createdAtMs: 1 }],
+  };
+  const target = createTabRecord("target", 0);
+  const transfer = createCarryTransfer(source, "target", "old-target-instance", 100, () => "transfer-1");
+  const store = faultingStore({ [sourceKey]: source, [targetKey]: target });
+  store.arm(2);
+  assert.throws(() => beginCarryTransfer(store, transfer), /simulated storage interruption/);
+  store.disarm();
+
+  const revivedSource = store.get(sourceKey, null);
+  revivedSource.active = {
+    id: "new-source-session",
+    channel: channel("Source"),
+    firstPlayMs: 200,
+    lastEligibleAtMs: 200,
+    durationMs: 0,
+  };
+  revivedSource.carry.parts.push({
+    id: "later",
+    durationMs: 7 * SECOND,
+    sourceTabId: "source",
+    createdAtMs: 200,
+  });
+  store.values.set(sourceKey, revivedSource);
+  const revivedTarget = store.get(targetKey, null);
+  revivedTarget.heartbeatMs = 300;
+  revivedTarget.instanceId = "new-target-instance";
+  store.values.set(targetKey, revivedTarget);
+
+  const result = completeCarryTransfer(store);
+  assert.deepEqual(result.source.carry.parts.map((part) => part.id), ["later"]);
+  assert.equal(result.source.active.id, "new-source-session");
+  assert.deepEqual(result.target.carry.parts.map((part) => part.id), ["moved"]);
+  assert.equal(result.target.heartbeatMs, 300);
+  assert.equal(result.target.instanceId, "new-target-instance");
+
+  const targetWithoutInstance = createTabRecord("target-without-instance", 300);
+  const secondTransfer = createCarryTransfer(
+    source,
+    "target-without-instance",
+    "recovered-target-instance",
+    100,
+    () => "transfer-2",
+  );
+  const secondStore = faultingStore({
+    [sourceKey]: source,
+    "yt-toggl:tab:v1:target-without-instance": targetWithoutInstance,
+  });
+  const secondResult = beginCarryTransfer(secondStore, secondTransfer);
+  assert.equal(secondResult.target.heartbeatMs, 300);
+  assert.equal(secondResult.target.instanceId, "recovered-target-instance");
+});
+
+test("carry transfer recovery survives interruptions while removing legacy owners", () => {
+  const part = { id: "moved", durationMs: 30 * SECOND, sourceTabId: "source", createdAtMs: 1 };
+  const unrelated = (id, sourceTabId) => ({
+    id,
+    durationMs: SECOND,
+    sourceTabId,
+    createdAtMs: 2,
+  });
+
+  for (let cut = 1; cut <= 5; cut += 1) {
+    const source = createTabRecord("source", 0);
+    source.carry = { parts: [part] };
+    const target = createTabRecord("target", 0);
+    const oldA = createTabRecord("old-a", 0);
+    oldA.carry = { parts: [part, unrelated("keep-a", "old-a")] };
+    oldA.active = {
+      id: "active-a",
+      channel: channel("A"),
+      firstPlayMs: 10,
+      lastEligibleAtMs: 10,
+      durationMs: 10,
+    };
+    const oldB = createTabRecord("old-b", 0);
+    oldB.carry = { parts: [unrelated("keep-b", "old-b"), part] };
+    const store = faultingStore({
+      "yt-toggl:tab:v1:source": source,
+      "yt-toggl:tab:v1:target": target,
+      "yt-toggl:tab:v1:old-a": oldA,
+      "yt-toggl:tab:v1:old-b": oldB,
+    });
+    const transfer = createCarryTransfer(source, "target", "target-instance", 100, () => "transfer");
+
+    store.arm(cut);
+    assert.throws(() => beginCarryTransfer(store, transfer), /simulated storage interruption/);
+    store.disarm();
+    completeCarryTransfer(store);
+
+    const records = [...store.values.entries()].filter(([key]) =>
+      key.startsWith("yt-toggl:tab:v1:"),
+    );
+    assert.deepEqual(
+      records
+        .filter(([_key, value]) => value.carry.parts.some((candidate) => candidate.id === part.id))
+        .map(([key]) => key),
+      ["yt-toggl:tab:v1:target"],
+      `cut ${cut} leaves one designated owner`,
+    );
+    assert.deepEqual(store.get("yt-toggl:tab:v1:old-a", null).carry.parts.map(({ id }) => id), [
+      "keep-a",
+    ]);
+    assert.equal(store.get("yt-toggl:tab:v1:old-a", null).active.id, "active-a");
+    assert.deepEqual(store.get("yt-toggl:tab:v1:old-b", null).carry.parts.map(({ id }) => id), [
+      "keep-b",
+    ]);
+  }
+});
+
+test("an explicit transfer removes legacy duplicate parts from every non-target tab", () => {
+  const part = { id: "legacy-duplicate", durationMs: 30 * SECOND, sourceTabId: "source", createdAtMs: 1 };
+  const source = createTabRecord("source", 0);
+  source.carry = { parts: [part] };
+  const oldTarget = createTabRecord("old-target", 0);
+  oldTarget.carry = { parts: [part] };
+  const newTarget = createTabRecord("new-target", 0);
+  const store = faultingStore({
+    "yt-toggl:tab:v1:source": source,
+    "yt-toggl:tab:v1:old-target": oldTarget,
+    "yt-toggl:tab:v1:new-target": newTarget,
+  });
+  const transfer = createCarryTransfer(source, "new-target", "new-instance", 100, () => "transfer-1");
+  beginCarryTransfer(store, transfer);
+
+  const owners = [...store.values.entries()]
+    .filter(([key]) => key.startsWith("yt-toggl:tab:v1:"))
+    .filter(([_key, record]) => record.carry.parts.some((candidate) => candidate.id === part.id))
+    .map(([key]) => key);
+  assert.deepEqual(owners, ["yt-toggl:tab:v1:new-target"]);
+});
+
+test("unreadable carry journals are preserved without blocking unrelated tab mutation", async () => {
+  const journalKey = "yt-toggl:carry-transfer:v1";
+  for (const [rawTransfer, kind] of [
+    [{ schemaVersion: 1, id: "broken" }, "malformed"],
+    [{ schemaVersion: 2, id: "from-a-newer-version" }, "unsupported-schema"],
+    [
+      {
+        schemaVersion: 1,
+        id: "partially-damaged",
+        sourceTabId: "source",
+        targetTabId: "target",
+        parts: [
+          { id: "valid", durationMs: SECOND, sourceTabId: "source", createdAtMs: 1 },
+          { id: "damaged", durationMs: 0, sourceTabId: "source", createdAtMs: 1 },
+        ],
+      },
+      "malformed",
+    ],
+    ...["", "   "].map((partId) => [
+      {
+        schemaVersion: 1,
+        id: `bad-part-${JSON.stringify(partId)}`,
+        sourceTabId: "source",
+        targetTabId: "target",
+        parts: [{ id: partId, durationMs: SECOND, sourceTabId: "source", createdAtMs: 1 }],
+      },
+      "malformed",
+    ]),
+  ]) {
+    const store = faultingStore({ [journalKey]: rawTransfer });
+    const result = completeCarryTransfer(store);
+    assert.equal(result.status, "unreadable");
+    assert.equal(result.kind, kind);
+    assert.deepEqual(result.rawTransfer, rawTransfer);
+    assert.deepEqual(store.get(journalKey, null), rawTransfer);
+  }
+
+  const invalid = { schemaVersion: 1, id: "still-broken" };
+  const store = faultingStore({ [journalKey]: invalid });
+  const app = Object.create(BrowserApp.prototype);
+  app.store = store;
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      locks: {
+        request: async (_name, _options, callback) => callback({ name: _name }),
+      },
+    },
+  });
+  try {
+    await app.withTabsLock(() => store.set("unrelated-mutation", { completed: true }));
+  } finally {
+    if (navigatorDescriptor) Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    else delete globalThis.navigator;
+  }
+  assert.deepEqual(store.get("unrelated-mutation", null), { completed: true });
+  assert.deepEqual(store.get(journalKey, null), invalid);
+});
+
+test("discarding an unreadable journal is exact and never mutates saved tab carry", () => {
+  const journalKey = "yt-toggl:carry-transfer:v1";
+  const part = { id: "carry", durationMs: 30 * SECOND, sourceTabId: "source", createdAtMs: 1 };
+  const source = createTabRecord("source", 0);
+  source.carry = { parts: [part] };
+  const target = createTabRecord("target", 0);
+  const rawTransfer = {
+    schemaVersion: 2,
+    id: "future-transfer",
+    sourceTabId: "source",
+    targetTabId: "target",
+    parts: [part],
+  };
+  const store = faultingStore({
+    [journalKey]: rawTransfer,
+    "yt-toggl:tab:v1:source": source,
+    "yt-toggl:tab:v1:target": target,
+  });
+  const originalSource = store.get("yt-toggl:tab:v1:source", null);
+  const originalTarget = store.get("yt-toggl:tab:v1:target", null);
+  const issue = carryTransferIssue(rawTransfer);
+  const validTransfer = createCarryTransfer(source, "target", "target-instance", 100, () => "valid");
+
+  assert.throws(
+    () => discardCarryTransferJournal(store, `${issue.fingerprint}:stale`),
+    /changed and was not discarded/i,
+  );
+  assert.throws(
+    () => beginCarryTransfer(store, validTransfer),
+    /another carry transfer must be recovered/i,
+  );
+  assert.equal(discardCarryTransferJournal(store, issue.fingerprint), true);
+  assert.equal(store.get(journalKey, null), null);
+  assert.deepEqual(store.get("yt-toggl:tab:v1:source", null), originalSource);
+  assert.deepEqual(store.get("yt-toggl:tab:v1:target", null), originalTarget);
+
+  beginCarryTransfer(store, validTransfer);
+  assert.deepEqual(
+    store.get("yt-toggl:tab:v1:target", null).carry.parts.map(({ id }) => id),
+    ["carry"],
+  );
+});
+
+test("only foreign stale empty tab records are prunable", () => {
+  const stale = createTabRecord("stale", 0);
+  assert.equal(tabRecordIsPrunable(stale, "current", 10 * MINUTE - 1, config()), false);
+  assert.equal(tabRecordIsPrunable(stale, "current", 10 * MINUTE, config()), true);
+  assert.equal(tabRecordIsPrunable(stale, "stale", 10 * MINUTE, config()), false);
+
+  stale.active = {
+    id: "zero-duration",
+    channel: channel("A"),
+    firstPlayMs: 0,
+    lastEligibleAtMs: 0,
+    durationMs: 0,
+  };
+  assert.equal(tabRecordIsPrunable(stale, "current", 10 * MINUTE, config()), false);
+  stale.active = null;
+  stale.carry = {
+    parts: [{ id: "carry", durationMs: 1, sourceTabId: "stale", createdAtMs: 1 }],
+  };
+  assert.equal(tabRecordIsPrunable(stale, "current", 10 * MINUTE, config()), false);
+});
+
+test("simultaneous duplicate resolvers leave exactly one owner of the persisted tab ID", async () => {
+  const candidateTabId = "shared-tab";
+  const apps = [Object.create(BrowserApp.prototype), Object.create(BrowserApp.prototype)];
+  for (const [index, app] of apps.entries()) {
+    Object.assign(app, {
+      store: {},
+      tabId: candidateTabId,
+      reusedTabId: true,
+      instanceId: `instance-${index}`,
+      sample: { existing: true },
+      inactivityDeadline: { sessionId: "session", atMonotonicMs: 1 },
+    });
+    app.probeTab = async (tabId) =>
+      apps.some((other) => other !== app && other.tabId === tabId);
+  }
+
+  const lockTails = new Map();
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const sessionStorageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      locks: {
+        async request(name, _options, callback) {
+          const previous = lockTails.get(name) || Promise.resolve();
+          let release;
+          const gate = new Promise((resolve) => {
+            release = resolve;
+          });
+          lockTails.set(name, previous.then(() => gate));
+          await previous;
+          try {
+            return await callback({ name });
+          } finally {
+            release();
+          }
+        },
+      },
+    },
+  });
+  Object.defineProperty(globalThis, "sessionStorage", {
+    configurable: true,
+    value: { setItem() {} },
+  });
+  try {
+    await Promise.all(apps.map((app) => app.resolveDuplicatedTabId()));
+  } finally {
+    if (navigatorDescriptor) Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    else delete globalThis.navigator;
+    if (sessionStorageDescriptor) {
+      Object.defineProperty(globalThis, "sessionStorage", sessionStorageDescriptor);
+    } else {
+      delete globalThis.sessionStorage;
+    }
+  }
+
+  assert.equal(apps.filter((app) => app.tabId === candidateTabId).length, 1);
+  assert.equal(new Set(apps.map((app) => app.tabId)).size, 2);
+});
+
+test("overlapping BFCache duplicate resolutions ignore an older probe result", async () => {
+  const candidateTabId = "restored-tab";
+  const app = Object.create(BrowserApp.prototype);
+  Object.assign(app, {
+    store: {},
+    tabId: candidateTabId,
+    reusedTabId: true,
+    identityResolved: false,
+    identityGeneration: 1,
+    instanceId: "restored-instance",
+    sample: { existing: true },
+    inactivityDeadline: { sessionId: "session", atMonotonicMs: 1 },
+  });
+
+  let firstProbeCount = 0;
+  let signalFirstProbesStarted;
+  const firstProbesStarted = new Promise((resolve) => {
+    signalFirstProbesStarted = resolve;
+  });
+  const releaseFirstProbes = [];
+  let probeCount = 0;
+  app.probeTab = () => {
+    probeCount += 1;
+    if (probeCount > 2) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      releaseFirstProbes.push(resolve);
+      firstProbeCount += 1;
+      if (firstProbeCount === 2) signalFirstProbesStarted();
+    });
+  };
+
+  const lockTails = new Map();
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const sessionStorageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      locks: {
+        async request(name, _options, callback) {
+          const previous = lockTails.get(name) || Promise.resolve();
+          let release;
+          const gate = new Promise((resolve) => {
+            release = resolve;
+          });
+          lockTails.set(name, previous.then(() => gate));
+          await previous;
+          try {
+            return await callback({ name });
+          } finally {
+            release();
+          }
+        },
+      },
+    },
+  });
+  Object.defineProperty(globalThis, "sessionStorage", {
+    configurable: true,
+    value: { setItem() {} },
+  });
+
+  try {
+    const olderResolution = app.resolveDuplicatedTabId(1);
+    await firstProbesStarted;
+
+    app.identityGeneration = 2;
+    app.reusedTabId = true;
+    const newerResolution = app.resolveDuplicatedTabId(2);
+    for (const resolve of releaseFirstProbes) resolve(false);
+
+    assert.equal(await olderResolution, null);
+    const resolvedIdentity = await newerResolution;
+    assert.notEqual(resolvedIdentity, null);
+    assert.equal(app.markIdentityResolved(resolvedIdentity), true);
+  } finally {
+    if (navigatorDescriptor) Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    else delete globalThis.navigator;
+    if (sessionStorageDescriptor) {
+      Object.defineProperty(globalThis, "sessionStorage", sessionStorageDescriptor);
+    } else {
+      delete globalThis.sessionStorage;
+    }
+  }
+
+  assert.notEqual(app.tabId, candidateTabId);
+  assert.equal(app.identityGeneration, 3);
+  assert.equal(app.identityResolved, true);
+  assert.equal(probeCount, 4);
+});
+
+test("tab recovery probes before locking and defers records changed during the probe", async () => {
+  const current = createTabRecord("current", Date.now());
+  const staleRecord = (tabId, sessionId, channelName) => {
+    const record = createTabRecord(tabId, 0);
+    record.instanceId = `${tabId}-instance`;
+    record.active = {
+      id: sessionId,
+      channel: channel(channelName),
+      firstPlayMs: 0,
+      lastEligibleAtMs: 0,
+      durationMs: MINUTE,
+    };
+    return record;
+  };
+  const unchanged = staleRecord("unchanged", "unchanged-session", "Unchanged");
+  const changedBeforeProbe = staleRecord("changed", "old-session", "Changed");
+  const changedAfterProbe = staleRecord("changed", "replacement-session", "Changed");
+  const newlyEligible = staleRecord("new", "new-session", "New");
+  let insideLock = false;
+  let releaseProbe;
+  let recordsReadCount = 0;
+  const probedTabIds = [];
+  const queued = [];
+  const deleted = [];
+  const written = [];
+  const app = Object.create(BrowserApp.prototype);
+  Object.assign(app, {
+    config: config({ minimumDurationMinutes: 0 }),
+    tabId: "current",
+    instanceId: "current-instance",
+    inactivityDeadline: null,
+    queue: {
+      get: () => [],
+      async add(entries) {
+        queued.push(...entries);
+      },
+      async remove() {},
+    },
+    store: {
+      set(key, value) {
+        written.push([key, value]);
+      },
+      delete(key) {
+        deleted.push(key);
+      },
+    },
+    getAllTabRecords() {
+      recordsReadCount += 1;
+      return recordsReadCount === 1
+        ? [current, unchanged, changedBeforeProbe]
+        : [current, unchanged, changedAfterProbe, newlyEligible];
+    },
+    getOwnRecord() {
+      return createTabRecord("current", Date.now());
+    },
+    probeTabs(tabIds) {
+      probedTabIds.push(...tabIds);
+      return new Promise((resolve) => {
+        releaseProbe = resolve;
+      });
+    },
+    withTabsLock(callback) {
+      insideLock = true;
+      return callback();
+    },
+  });
+
+  const recovery = app.recoverTabs();
+  assert.deepEqual(probedTabIds.sort(), ["changed", "unchanged"]);
+  assert.equal(insideLock, false, "probe timers must not run under the tabs lock");
+  releaseProbe({ live: new Set(), indeterminate: new Set() });
+  await recovery;
+
+  assert.equal(insideLock, true);
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].description, "Unchanged");
+  assert.deepEqual(deleted, ["yt-toggl:tab:v1:unchanged"]);
+  assert.equal(
+    deleted.includes("yt-toggl:tab:v1:changed") || deleted.includes("yt-toggl:tab:v1:new"),
+    false,
+  );
+  assert.equal(
+    written.some(([key]) =>
+      ["yt-toggl:tab:v1:changed", "yt-toggl:tab:v1:new"].includes(key),
+    ),
+    false,
+  );
+});
+
+test("BFCache identity invalidation cancels recovery after its out-of-lock probe", async () => {
+  const current = createTabRecord("old-tab", Date.now());
+  const foreign = createTabRecord("foreign", 0);
+  foreign.instanceId = "foreign-instance";
+  foreign.active = {
+    id: "foreign-session",
+    channel: channel("Foreign"),
+    firstPlayMs: 0,
+    lastEligibleAtMs: 0,
+    durationMs: MINUTE,
+  };
+  let releaseProbe;
+  let enteredTabsLock = false;
+  const app = Object.create(BrowserApp.prototype);
+  Object.assign(app, {
+    config: config({ minimumDurationMinutes: 0 }),
+    tabId: "old-tab",
+    instanceId: "old-instance",
+    identityResolved: true,
+    identityGeneration: 0,
+    inactivityDeadline: null,
+    getAllTabRecords: () => [current, foreign],
+    probeTabs: () =>
+      new Promise((resolve) => {
+        releaseProbe = resolve;
+      }),
+    withTabsLock() {
+      enteredTabsLock = true;
+    },
+  });
+
+  const recovery = app.recoverTabs();
+  app.identityResolved = false;
+  app.identityGeneration += 1;
+  releaseProbe({ live: new Set(), indeterminate: new Set() });
+  await recovery;
+  assert.equal(enteredTabsLock, false);
+});
+
+test("identity invalidation during queue persistence prevents an old-tab commit", async () => {
+  let releaseQueue;
+  let queueStarted = false;
+  const removedEntries = [];
+  const writes = [];
+  let workerKicks = 0;
+  const app = Object.create(BrowserApp.prototype);
+  Object.assign(app, {
+    tabId: "old-tab",
+    instanceId: "old-instance",
+    identityResolved: true,
+    identityGeneration: 0,
+    sample: "old-sample",
+    inactivityDeadline: "old-deadline",
+    queue: {
+      get: () => [],
+      add() {
+        queueStarted = true;
+        return new Promise((resolve) => {
+          releaseQueue = resolve;
+        });
+      },
+      async remove(entryId) {
+        removedEntries.push(entryId);
+      },
+    },
+    store: { set: (key, value) => writes.push([key, value]) },
+    worker: { kick: () => (workerKicks += 1) },
+  });
+  const machineState = {
+    record: createTabRecord("old-tab", 0),
+    sample: "new-sample",
+    inactivityDeadline: "new-deadline",
+  };
+  const identity = app.captureIdentity();
+  const commit = app.commitMachine(machineState, [{ id: "queued" }], 100, "", identity);
+  assert.equal(queueStarted, true);
+  app.identityResolved = false;
+  app.identityGeneration += 1;
+  releaseQueue();
+  assert.equal(await commit, false);
+  assert.deepEqual(removedEntries, ["queued"]);
+  assert.deepEqual(writes, []);
+  assert.equal(app.sample, "old-sample");
+  assert.equal(app.inactivityDeadline, "old-deadline");
+  assert.equal(workerKicks, 0);
+});
+
+test("queued carry actions are cancelled when their captured tab identity is invalidated", async () => {
+  let releaseEarlierOperation;
+  let enteredTabsLock = false;
+  const app = Object.create(BrowserApp.prototype);
+  Object.assign(app, {
+    tabId: "old-tab",
+    identityResolved: true,
+    identityGeneration: 0,
+    operation: new Promise((resolve) => {
+      releaseEarlierOperation = resolve;
+    }),
+    status: { render() {} },
+    withTabsLock() {
+      enteredTabsLock = true;
+    },
+  });
+  const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { confirm: () => true },
+  });
+  try {
+    const discard = app.discardCurrentCarry();
+    app.identityResolved = false;
+    app.identityGeneration += 1;
+    releaseEarlierOperation();
+    await discard;
+  } finally {
+    if (windowDescriptor) Object.defineProperty(globalThis, "window", windowDescriptor);
+    else delete globalThis.window;
+  }
+  assert.equal(enteredTabsLock, false);
+});
+
+test("browser startup mounts status before duplicate-tab resolution completes", async () => {
+  const calls = [];
+  const commands = [];
+  let releaseIdentity;
+  const app = Object.create(BrowserApp.prototype);
+  Object.assign(app, {
+    tabId: "startup-tab",
+    reusedTabId: false,
+    identityResolved: false,
+    identityGeneration: 0,
+    status: {
+      mount() {
+        calls.push("mount");
+        app.broadcastSync();
+      },
+      render: () => calls.push("render"),
+    },
+    intervals: [],
+    worker: { kick: () => calls.push("worker") },
+    store: { set: (_key, value) => commands.push(value) },
+    handleSync: () => calls.push("sync"),
+    resolveDuplicatedTabId() {
+      calls.push("resolve-start");
+      return new Promise((resolve) => {
+        releaseIdentity = () =>
+          resolve({ tabId: app.tabId, generation: app.identityGeneration });
+      });
+    },
+    recoverTabs: async () => calls.push("recover"),
+    bindEvents: () => calls.push("bind"),
+    tick: async () => calls.push("tick"),
+  });
+  const originalSetInterval = globalThis.setInterval;
+  globalThis.setInterval = () => 1;
+  try {
+    const starting = app.start();
+    assert.deepEqual(calls, ["mount", "resolve-start"]);
+    assert.equal(commands.length, 0, "the mounted controls cannot mutate a reused tab ID");
+    releaseIdentity();
+    await starting;
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+  }
+  assert.deepEqual(calls, [
+    "mount",
+    "resolve-start",
+    "render",
+    "recover",
+    "bind",
+    "tick",
+    "worker",
+  ]);
+  app.broadcastSync();
+  assert.equal(commands.length, 1);
+  assert.equal(calls.at(-1), "sync");
+});
+
 test("same-channel SPA navigation continues one session", () => {
   const tracker = machine({ minimumDurationMinutes: 0 });
   const sameChannel = channel("A");
@@ -263,6 +1340,168 @@ test("channel IDs take precedence, with channel-name fallback during identity up
   assert.equal(channelsEqual({ id: "UC1", name: "Same" }, { id: "UC2", name: "Same" }), false);
   assert.equal(channelsEqual({ id: "", name: "Same" }, { id: "UC1", name: "same" }), true);
   assert.equal(channelFromVideoData({ channel_id: "UC9", author: "Creator" }).id, "UC9");
+});
+
+test("media discovery stays neutral until player identity matches the watch route", () => {
+  let nowMs = 0;
+  let monotonicMs = 0;
+  let mediaTime = 0;
+  let adShowing = false;
+  let playerData = { video_id: "video-a", channel_id: "UC-A", author: "A" };
+  const pageWindow = {
+    ytInitialPlayerResponse: {
+      videoDetails: { videoId: "video-b", channelId: "UC-B", author: "B" },
+    },
+  };
+  class FakeDate extends Date {
+    static now() {
+      return nowMs;
+    }
+  }
+  const player = {
+    classList: {
+      contains(name) {
+        return adShowing && (name === "ad-showing" || name === "ad-interrupting");
+      },
+    },
+    getVideoData() {
+      return playerData;
+    },
+  };
+  const video = {
+    paused: false,
+    ended: false,
+    readyState: 4,
+    seeking: false,
+    playbackRate: 1,
+    currentSrc: "blob:video-b",
+    get currentTime() {
+      return mediaTime;
+    },
+    played: {
+      length: 1,
+      start: () => 0,
+      end: () => mediaTime,
+    },
+    closest(selector) {
+      return selector === "#movie_player" || selector === ".html5-video-player" ? player : null;
+    },
+  };
+  let globalPlayer = player;
+  const document = {
+    querySelectorAll: () => [video],
+    querySelector: () => null,
+    getElementById: (id) => (id === "movie_player" ? globalPlayer : null),
+  };
+  const context = {
+    URL,
+    TextEncoder,
+    Date: FakeDate,
+    Math,
+    JSON,
+    Promise,
+    Symbol,
+    document,
+    location: {
+      href: "https://www.youtube.com/watch?v=video-b",
+      pathname: "/watch",
+      search: "?v=video-b",
+    },
+    performance: { now: () => monotonicMs },
+    unsafeWindow: pageWindow,
+    module: { exports: {} },
+  };
+  const source = fs.readFileSync(require.resolve("../yt-toggl.user.js"), "utf8");
+  vm.runInNewContext(source, context, { filename: "yt-toggl.user.js" });
+  const core = context.module.exports;
+  const tracker = new core.SessionMachine(config(), core.createTabRecord("tab", 0), {
+    idFactory: idFactory("identity"),
+  });
+
+  const firstStale = core.discoverMedia(0);
+  nowMs = 2 * SECOND;
+  monotonicMs = 2 * SECOND;
+  mediaTime = 2;
+  const secondStale = core.discoverMedia(0);
+  for (const stale of [firstStale, secondStale]) {
+    assert.equal(stale.eligible, false);
+    assert.equal(stale.channel, null);
+    assert.equal(stale.mediaKey, "");
+    tracker.tick(stale);
+  }
+  assert.equal(tracker.record.active, null);
+  assert.equal(carryDurationMs(tracker.record.carry), 0);
+
+  playerData = { video_id: "video-b", channel_id: "UC-B", author: "B" };
+  nowMs = 3 * SECOND;
+  monotonicMs = 3 * SECOND;
+  mediaTime = 3;
+  const coherent = core.discoverMedia(0);
+  assert.equal(coherent.eligible, true);
+  assert.equal(coherent.channel.id, "UC-B");
+  assert.equal(coherent.mediaKey, "video-b");
+  tracker.tick(coherent);
+  assert.equal(tracker.record.active.channel.id, "UC-B");
+  assert.equal(carryDurationMs(tracker.record.carry), 0);
+
+  playerData = { channel_id: "UC-A", author: "A" };
+  const initialFallback = core.discoverMedia(0);
+  assert.equal(initialFallback.channel.id, "UC-B");
+  pageWindow.ytInitialPlayerResponse = {
+    videoDetails: { channelId: "UC-B", author: "B" },
+  };
+  const unidentified = core.discoverMedia(0);
+  assert.equal(unidentified.eligible, false);
+  assert.equal(unidentified.channel, null);
+
+  context.location.href = "https://www.youtube.com/shorts/video-b";
+  context.location.pathname = "/shorts/video-b";
+  context.location.search = "";
+  pageWindow.ytInitialPlayerResponse = {
+    videoDetails: { videoId: "video-b", channelId: "UC-B", author: "B" },
+  };
+  playerData = { video_id: "video-a", channel_id: "UC-A", author: "A" };
+  const staleShort = core.discoverMedia(0);
+  assert.equal(staleShort.eligible, false);
+  assert.equal(staleShort.channel, null);
+
+  globalPlayer = {
+    classList: { contains: () => false },
+    getVideoData: () => ({ video_id: "video-a", channel_id: "UC-A", author: "A" }),
+  };
+  playerData = { video_id: "video-b", channel_id: "UC-B", author: "B" };
+  const coherentShort = core.discoverMedia(0);
+  assert.equal(coherentShort.eligible, true);
+  assert.equal(coherentShort.channel.id, "UC-B");
+  assert.equal(coherentShort.mediaKey, "video-b");
+
+  context.location.href = "https://www.youtube.com/results?search_query=test";
+  context.location.pathname = "/results";
+  context.location.search = "?search_query=test";
+  pageWindow.ytInitialPlayerResponse = {
+    videoDetails: { videoId: "miniplayer", channelId: "UC-mini", author: "Mini" },
+  };
+  playerData = { channel_id: "UC-stale", author: "Stale" };
+  const miniplayer = core.discoverMedia(0);
+  assert.equal(miniplayer.eligible, true);
+  assert.equal(miniplayer.channel.id, "UC-mini");
+  assert.equal(miniplayer.mediaKey, "miniplayer");
+  pageWindow.ytInitialPlayerResponse = {
+    videoDetails: { videoId: "miniplayer", channelId: "UC-mini" },
+  };
+  playerData = { channelId: "UC-stale", ownerChannelName: "Stale" };
+  const camelCaseStale = core.discoverMedia(0);
+  assert.equal(camelCaseStale.channel.id, "UC-mini");
+  assert.equal(camelCaseStale.channel.name, "");
+
+  context.location.href = "https://www.youtube.com/watch?v=video-b";
+  context.location.pathname = "/watch";
+  context.location.search = "?v=video-b";
+  playerData = { video_id: "advertiser", channel_id: "UC-ad", author: "Advertiser" };
+  adShowing = true;
+  const ad = core.discoverMedia(0);
+  assert.equal(ad.eligible, false);
+  assert.equal(ad.channel, null);
 });
 
 test("2× playback counts real elapsed wall time", () => {
@@ -339,10 +1578,47 @@ test("live streams use the duration-independent playback state machine", () => {
 });
 
 test("active Shorts video selection prefers genuine playback", () => {
+  const shortPlayer = { id: "shorts-player" };
+  const activeReel = {};
   const regularPaused = { paused: true, ended: false, readyState: 4, closest: () => null };
-  const activeShort = { paused: false, ended: false, readyState: 4, closest: () => ({}) };
-  const preloadedShort = { paused: true, ended: false, readyState: 4, closest: () => ({}) };
+  const activeShort = {
+    paused: false,
+    ended: false,
+    readyState: 4,
+    closest: (selector) => {
+      if (selector === "ytd-reel-video-renderer[is-active]") return activeReel;
+      if (selector === ".html5-video-player") return shortPlayer;
+      return null;
+    },
+  };
+  const preloadedShort = {
+    paused: true,
+    ended: false,
+    readyState: 4,
+    closest: () => null,
+  };
   assert.equal(selectActiveVideo([regularPaused, activeShort, preloadedShort]), activeShort);
+});
+
+test("thumbnail hover previews are never selected as watchable playback", () => {
+  const mainPlayer = { id: "movie_player" };
+  const inlinePreviewPlayer = { id: "inline-player" };
+  const hoverPreview = {
+    paused: false,
+    ended: false,
+    readyState: 4,
+    closest: (selector) =>
+      selector === ".html5-video-player" ? inlinePreviewPlayer : null,
+  };
+  const pausedMainVideo = {
+    paused: true,
+    ended: false,
+    readyState: 4,
+    closest: (selector) => (selector === "#movie_player" ? mainPlayer : null),
+  };
+
+  assert.equal(selectActiveVideo([hoverPreview]), null);
+  assert.equal(selectActiveVideo([hoverPreview, pausedMainVideo]), pausedMainVideo);
 });
 
 test("global Sync finalizes simultaneous tabs independently and starts fresh sessions", () => {
@@ -420,6 +1696,56 @@ test("request spacing enforces one attempt per second", () => {
   assert.equal(requestSpacingDelay(10_000, 11_000), 0);
   assert.equal(requestSpacingDelay(10_000, 12_000), 0);
   assert.equal(requestSpacingDelay(12_000, 10_000), 1000, "clock rollback cannot cause a long sleep");
+});
+
+test("the worker stops after three queue claim misses", async () => {
+  const candidate = normalizeQueue([
+    {
+      id: "entry:claim-race",
+      description: "A",
+      start: new Date(0).toISOString(),
+      duration: 60,
+      status: "pending",
+    },
+  ])[0];
+  const values = new Map();
+  const store = {
+    get: (key, fallback) => (values.has(key) ? values.get(key) : fallback),
+    set: (key, value) => values.set(key, value),
+    delete: (key) => values.delete(key),
+  };
+  let getCalls = 0;
+  let mutateCalls = 0;
+  const queue = {
+    get() {
+      getCalls += 1;
+      return [candidate];
+    },
+    async mutate(callback) {
+      mutateCalls += 1;
+      callback([]);
+      return [];
+    },
+  };
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      locks: {
+        request: async (_name, _options, callback) => callback({}),
+      },
+    },
+  });
+  try {
+    const worker = new TogglWorker(store, queue, config());
+    assert.equal(await worker.drain(), true);
+  } finally {
+    if (navigatorDescriptor) Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    else delete globalThis.navigator;
+  }
+
+  assert.equal(getCalls, 3);
+  assert.equal(mutateCalls, 4, "one interrupted-request pass plus three bounded claim attempts");
 });
 
 test("wall time that advances during suspension is rejected when the monotonic clock does not", () => {
@@ -543,12 +1869,45 @@ test("configuration accepts a zero minimum but rejects missing credentials", () 
 
 test("userscript metadata is directly installable and declares only local dependencies", () => {
   const source = fs.readFileSync(require.resolve("../yt-toggl.user.js"), "utf8");
+  const packageMetadata = JSON.parse(
+    fs.readFileSync(require.resolve("../package.json"), "utf8"),
+  );
   assert.match(source, /\/\/ ==UserScript==/);
   assert.match(source, /\/\/ @match\s+https:\/\/www\.youtube\.com\/\*/);
   assert.match(source, /\/\/ @grant\s+GM_xmlhttpRequest/);
   assert.match(source, /\/\/ @grant\s+GM_getValue/);
   assert.match(source, /\/\/ @connect\s+api\.track\.toggl\.com/);
+  assert.match(source, /\/\/ @noframes\b/);
   assert.doesNotMatch(source, /\/\/ @require\b/);
+  assert.equal(source.match(/\/\/ @version\s+(\S+)/)[1], packageMetadata.version);
+});
+
+test("browser bootstrap stays inactive inside child frames", () => {
+  let createElementCalls = 0;
+  const frameWindow = {
+    addEventListener() {},
+  };
+  frameWindow.self = frameWindow;
+  frameWindow.top = {};
+  const context = {
+    window: frameWindow,
+    document: {
+      createElement() {
+        createElementCalls += 1;
+        throw new Error("child frames must not mount the status control");
+      },
+    },
+    GM_getValue() {
+      throw new Error("child frames must not initialize storage");
+    },
+    module: { exports: {} },
+  };
+  const source = fs.readFileSync(require.resolve("../yt-toggl.user.js"), "utf8");
+
+  vm.runInNewContext(source, context, { filename: "yt-toggl.user.js" });
+
+  assert.equal(createElementCalls, 0);
+  assert.equal(typeof context.module.exports.BrowserApp, "function");
 });
 
 test("browser bootstrap mounts status under Trusted Types enforcement and stays offline", async () => {
@@ -571,7 +1930,10 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
       hidden: false,
       isConnected: false,
       textContent: "",
-      addEventListener() {},
+      eventListeners: new Map(),
+      addEventListener(name, callback) {
+        this.eventListeners.set(name, callback);
+      },
       setAttribute(name, value) {
         this[name] = value;
       },
@@ -622,10 +1984,116 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
     addEventListener() {},
   };
   const values = new Map();
+  values.set("yt-toggl:tab:v1:stale-empty", createTabRecord("stale-empty", 0));
+  const pendingPart = {
+    id: "pending-part",
+    durationMs: 30 * SECOND,
+    sourceTabId: "transfer-source",
+    createdAtMs: 1,
+  };
+  const transferSource = createTabRecord("transfer-source", 0);
+  transferSource.carry = { parts: [pendingPart] };
+  const transferTarget = createTabRecord("transfer-target", 0);
+  transferTarget.carry = { parts: [pendingPart] };
+  values.set("yt-toggl:tab:v1:transfer-source", transferSource);
+  values.set("yt-toggl:tab:v1:transfer-target", transferTarget);
+  values.set("yt-toggl:carry-transfer:v1", {
+    schemaVersion: 1,
+    id: "pending-transfer",
+    sourceTabId: "transfer-source",
+    targetTabId: "transfer-target",
+    parts: [pendingPart],
+    createdAtMs: 1,
+    targetInstanceId: "old-target-instance",
+  });
+  const foreignLive = createTabRecord("foreign-live", 0);
+  foreignLive.instanceId = "foreign-instance";
+  foreignLive.active = {
+    id: "foreign-session",
+    channel: channel("Foreign"),
+    firstPlayMs: 0,
+    lastEligibleAtMs: 0,
+    durationMs: MINUTE,
+  };
+  values.set("yt-toggl:tab:v1:foreign-live", foreignLive);
+  const foreignIdleLive = createTabRecord("foreign-idle-live", 0);
+  foreignIdleLive.instanceId = "foreign-idle-instance";
+  values.set("yt-toggl:tab:v1:foreign-idle-live", foreignIdleLive);
+  const foreignFresh = createTabRecord("foreign-fresh", Date.now());
+  foreignFresh.instanceId = "foreign-fresh-instance";
+  foreignFresh.active = {
+    id: "foreign-fresh-session",
+    channel: channel("Fresh"),
+    firstPlayMs: 0,
+    lastEligibleAtMs: 0,
+    durationMs: MINUTE,
+  };
+  values.set("yt-toggl:tab:v1:foreign-fresh", foreignFresh);
+  const foreignIndeterminate = createTabRecord("foreign-indeterminate", 0);
+  foreignIndeterminate.instanceId = "foreign-indeterminate-instance";
+  foreignIndeterminate.active = {
+    id: "foreign-indeterminate-session",
+    channel: channel("Indeterminate"),
+    firstPlayMs: 0,
+    lastEligibleAtMs: 0,
+    durationMs: MINUTE,
+  };
+  values.set("yt-toggl:tab:v1:foreign-indeterminate", foreignIndeterminate);
   const listeners = new Map();
   const sessionValues = new Map();
+  sessionValues.set("yt-toggl:tab-id:v1", "copied-tab");
+  const intervals = [];
+  let listValuesCount = 0;
   let requestCount = 0;
   let sequence = 0;
+  const windowListeners = new Map();
+  const broadcastChannels = new Set();
+  const respondingTabIds = new Set(["copied-tab", "foreign-live", "foreign-idle-live"]);
+  const failingProbeTabIds = new Set(["foreign-indeterminate"]);
+  const failingStorageProbeTabIds = new Set(["foreign-indeterminate"]);
+  const storageRespondingTabIds = new Set();
+  const delayedProbeTabIds = new Set();
+  class FakeBroadcastChannel {
+    constructor() {
+      this.listeners = [];
+      broadcastChannels.add(this);
+    }
+    addEventListener(_name, callback) {
+      this.listeners.push(callback);
+    }
+    postMessage(message) {
+      if (message.type === "probe" && failingProbeTabIds.has(message.tabId)) {
+        throw new Error("simulated BroadcastChannel failure");
+      }
+      for (const channel of broadcastChannels) {
+        if (channel === this) continue;
+        queueMicrotask(() => {
+          for (const callback of channel.listeners) callback({ data: message });
+        });
+      }
+    }
+    close() {
+      broadcastChannels.delete(this);
+    }
+  }
+  const foreignResponder = new FakeBroadcastChannel();
+  foreignResponder.addEventListener("message", ({ data: message }) => {
+    if (
+      message.type !== "probe" ||
+      !respondingTabIds.has(message.tabId)
+    ) {
+      return;
+    }
+    const respond = () =>
+      foreignResponder.postMessage({
+        type: "alive",
+        probeId: message.probeId,
+        targetId: message.requesterId,
+        responderId: `responder:${message.tabId}`,
+      });
+    if (delayedProbeTabIds.has(message.tabId)) setTimeout(respond, 350);
+    else respond();
+  });
 
   const context = {
     URL,
@@ -653,19 +2121,46 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
       getItem: (key) => sessionValues.get(key) || null,
       setItem: (key, value) => sessionValues.set(key, value),
     },
-    BroadcastChannel: class {
-      addEventListener() {}
-      postMessage() {}
-      close() {}
-    },
+    BroadcastChannel: FakeBroadcastChannel,
     GM_getValue: (key, fallback) => (values.has(key) ? values.get(key) : fallback),
     GM_setValue: (key, value) => {
+      if (
+        key === "yt-toggl:instance-probe:v1" &&
+        value &&
+        value.type === "probe" &&
+        failingStorageProbeTabIds.has(value.tabId)
+      ) {
+        throw new Error("simulated shared-value probe failure");
+      }
       const oldValue = values.get(key);
       values.set(key, value);
       for (const callback of listeners.get(key) || []) callback(key, oldValue, value, false);
+      if (
+        key === "yt-toggl:instance-probe:v1" &&
+        value &&
+        value.type === "probe" &&
+        storageRespondingTabIds.has(value.tabId)
+      ) {
+        queueMicrotask(() => {
+          const response = {
+            type: "alive",
+            probeId: value.probeId,
+            targetId: value.requesterId,
+            responderId: `storage-responder:${value.tabId}`,
+          };
+          const current = values.get(key);
+          values.set(key, response);
+          for (const callback of listeners.get(key) || []) {
+            callback(key, current, response, true);
+          }
+        });
+      }
     },
     GM_deleteValue: (key) => values.delete(key),
-    GM_listValues: () => [...values.keys()],
+    GM_listValues: () => {
+      listValuesCount += 1;
+      return [...values.keys()];
+    },
     GM_addValueChangeListener: (key, callback) => {
       if (!listeners.has(key)) listeners.set(key, []);
       listeners.get(key).push(callback);
@@ -678,11 +2173,17 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
     btoa: (input) => Buffer.from(input, "binary").toString("base64"),
     setTimeout,
     clearTimeout,
-    setInterval: () => 1,
+    setInterval: (callback, delay) => {
+      intervals.push({ callback, delay });
+      return intervals.length;
+    },
     clearInterval() {},
   };
   context.window = {
-    addEventListener() {},
+    addEventListener(name, callback) {
+      if (!windowListeners.has(name)) windowListeners.set(name, []);
+      windowListeners.get(name).push(callback);
+    },
     confirm: () => true,
   };
 
@@ -693,6 +2194,90 @@ test("browser bootstrap mounts status under Trusted Types enforcement and stays 
   assert.equal(requestCount, 0);
   assert.equal(body.children.some((child) => child.id === "yt-toggl-status-host"), true);
   const tabKeys = [...values.keys()].filter((key) => key.startsWith("yt-toggl:tab:v1:"));
-  assert.equal(tabKeys.length, 1);
-  assert.equal(values.get(tabKeys[0]).active, null);
+  assert.equal(tabKeys.length, 6);
+  assert.notEqual(sessionValues.get("yt-toggl:tab-id:v1"), "copied-tab");
+  assert.equal(values.has("yt-toggl:tab:v1:copied-tab"), false);
+  assert.equal(values.has("yt-toggl:carry-transfer:v1"), false);
+  assert.equal(values.has("yt-toggl:tab:v1:transfer-source"), false);
+  assert.deepEqual(
+    values.get("yt-toggl:tab:v1:transfer-target").carry.parts.map((part) => part.id),
+    ["pending-part"],
+  );
+  assert.notEqual(values.get("yt-toggl:tab:v1:foreign-live").active, null);
+  assert.equal(values.has("yt-toggl:tab:v1:foreign-idle-live"), true);
+  assert.notEqual(values.get("yt-toggl:tab:v1:foreign-fresh").active, null);
+  assert.notEqual(values.get("yt-toggl:tab:v1:foreign-indeterminate").active, null);
+  const ownTabId = sessionValues.get("yt-toggl:tab-id:v1");
+  assert.equal(values.get(`yt-toggl:tab:v1:${ownTabId}`).active, null);
+
+  assert.equal(intervals.filter((interval) => interval.delay === SECOND).length, 1);
+  const tickInterval = intervals.find((interval) => interval.delay === SECOND);
+  const collapsedScanCount = listValuesCount;
+  await tickInterval.callback();
+  assert.equal(listValuesCount, collapsedScanCount, "collapsed ticks do not enumerate tab records");
+
+  const host = body.children.find((child) => child.id === "yt-toggl-status-host");
+  const summary = host.shadowRoot.getElementById("summary");
+  summary.eventListeners.get("click")();
+  assert.equal(listValuesCount, collapsedScanCount + 1, "expanding scans stale carry once");
+  summary.eventListeners.get("click")();
+  await tickInterval.callback();
+  assert.equal(listValuesCount, collapsedScanCount + 1, "collapsing stops stale-tab scans again");
+
+  const unreadableTransfer = { schemaVersion: 2, id: "newer-transfer" };
+  values.set("yt-toggl:carry-transfer:v1", unreadableTransfer);
+  await tickInterval.callback();
+  assert.deepEqual(values.get("yt-toggl:carry-transfer:v1"), unreadableTransfer);
+  assert.equal(values.has("yt-toggl:errors:v1"), false, "ticks do not spam errors for the journal");
+  summary.eventListeners.get("click")();
+  const orphanBox = host.shadowRoot.getElementById("orphans");
+  const unreadableAction = (() => {
+    const pending = [orphanBox];
+    while (pending.length) {
+      const node = pending.shift();
+      if (node.textContent === "Discard saved transfer") return node;
+      pending.push(...node.children);
+    }
+    return null;
+  })();
+  assert.notEqual(unreadableAction, null);
+  unreadableAction.eventListeners.get("click")();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(values.has("yt-toggl:carry-transfer:v1"), false);
+  summary.eventListeners.get("click")();
+
+  respondingTabIds.add(ownTabId);
+  for (const callback of windowListeners.get("pagehide") || []) callback({ persisted: true });
+  for (const callback of windowListeners.get("pageshow") || []) callback({ persisted: true });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const restoredTabId = sessionValues.get("yt-toggl:tab-id:v1");
+  assert.notEqual(restoredTabId, ownTabId, "a BFCache collision mints a new logical tab ID");
+  assert.equal(values.has(`yt-toggl:tab:v1:${restoredTabId}`), true);
+
+  failingProbeTabIds.add(restoredTabId);
+  storageRespondingTabIds.add(restoredTabId);
+  for (const callback of windowListeners.get("pagehide") || []) callback({ persisted: true });
+  for (const callback of windowListeners.get("pageshow") || []) callback({ persisted: true });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const transportFailureTabId = sessionValues.get("yt-toggl:tab-id:v1");
+  assert.notEqual(
+    transportFailureTabId,
+    restoredTabId,
+    "the shared-value fallback isolates tabs when BroadcastChannel fails",
+  );
+  assert.equal(values.has(`yt-toggl:tab:v1:${transportFailureTabId}`), true);
+
+  respondingTabIds.add(transportFailureTabId);
+  delayedProbeTabIds.add(transportFailureTabId);
+  for (const callback of windowListeners.get("pagehide") || []) callback({ persisted: true });
+  for (const callback of windowListeners.get("pageshow") || []) callback({ persisted: true });
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  const delayedResponseTabId = sessionValues.get("yt-toggl:tab-id:v1");
+  assert.notEqual(
+    delayedResponseTabId,
+    transportFailureTabId,
+    "a delayed live response still isolates the duplicated logical tab",
+  );
+  assert.equal(values.has(`yt-toggl:tab:v1:${delayedResponseTabId}`), true);
+  assert.equal(requestCount, 0);
 });
