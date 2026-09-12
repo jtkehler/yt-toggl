@@ -25,6 +25,7 @@ const CONFIG = {
   inactivityMinutes: 10,
   minimumDurationMinutes: 1,
   mergeBelowMinimum: true,
+  dayBoundary: null, // Off; set a local 24-hour time such as "04:00".
   maxRequestsPerHour: 30,
 };
 
@@ -65,6 +66,23 @@ function makeDescription(channel) {
 
   function minimumDurationMs(config = CONFIG) {
     return Math.max(0, finiteNumber(config.minimumDurationMinutes, 1)) * 60 * 1000;
+  }
+
+  function dayBoundaryMinutes(config = CONFIG) {
+    const value = config.dayBoundary;
+    if (value === null || value === undefined) return 0;
+    if (typeof value !== "string" || value.length !== 5 || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)) return NaN;
+    const [hours, minutes] = value.split(":").map(Number);
+    return hours * 60 + minutes;
+  }
+
+  function togglStartTime(firstPlayMs, boundaryMinutes) {
+    const start = new Date(firstPlayMs);
+    if (start.getHours() * 60 + start.getMinutes() < boundaryMinutes) {
+      // Use the previous local calendar date, including its own DST offset.
+      return new Date(start.getFullYear(), start.getMonth(), start.getDate() - 1, 23, 59, 0, 0).toISOString();
+    }
+    return start.toISOString();
   }
 
   function normalizedText(value) {
@@ -249,6 +267,7 @@ function makeDescription(channel) {
       errors.push("CONFIG.maxRequestsPerHour must be a positive integer.");
     }
     if (typeof config.mergeBelowMinimum !== "boolean") errors.push("CONFIG.mergeBelowMinimum must be a boolean.");
+    if (!Number.isFinite(dayBoundaryMinutes(config))) errors.push('CONFIG.dayBoundary must be null or a 24-hour time in HH:MM format (00:00–23:59).');
     return errors;
   }
 
@@ -765,8 +784,9 @@ function makeDescription(channel) {
       if (group.durationMs <= 0) return null;
       const belowMinimum = group.durationMs < minimumDurationMs(config) || Math.round(group.durationMs / 1000) < 1;
       if (belowMinimum && config.mergeBelowMinimum) return null;
-      // Capture works before setup; freeze a destination only once it is usable.
-      if (!belowMinimum && (!Number.isInteger(Number(config.togglWorkspaceId)) || Number(config.togglWorkspaceId) <= 0 ||
+      const boundaryMinutes = dayBoundaryMinutes(config);
+      // Capture works before setup; freeze a payload only once its settings are usable.
+      if (!belowMinimum && (!Number.isFinite(boundaryMinutes) || !Number.isInteger(Number(config.togglWorkspaceId)) || Number(config.togglWorkspaceId) <= 0 ||
           (config.togglProjectId !== null && (!Number.isInteger(Number(config.togglProjectId)) || Number(config.togglProjectId) <= 0)))) return null;
       const sources = group.pending.map((record) => ({ recordId: record.id, fromMs: record.consumedMs,
         toMs: record.durationMs, durationMs: record.durationMs - record.consumedMs, startMs: record.pendingStartMs }));
@@ -778,7 +798,7 @@ function makeDescription(channel) {
       if (belowMinimum) return null;
       const batch = { id: randomId("batch"), channel: clone(group.channel),
         description: typeof makeDescription === "function" ? makeDescription(clone(group.channel)) : group.channel.name || group.channel.id || "YouTube",
-        start: new Date(group.firstPlayMs).toISOString(), duration: Math.round(group.durationMs / 1000),
+        start: togglStartTime(group.firstPlayMs, boundaryMinutes), duration: Math.round(group.durationMs / 1000),
         durationMs: group.durationMs, workspaceId: Number(config.togglWorkspaceId),
         projectId: config.togglProjectId === null ? null : Number(config.togglProjectId),
         sources, createdAtMs: nowMs, status: "pending", nextAttemptAtMs: 0, message: "" };

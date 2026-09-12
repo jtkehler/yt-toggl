@@ -120,6 +120,85 @@ test("minimum zero is supported and merge mode must be a boolean", () => {
   assert.ok(api.validateConfig(cfg({ mergeBelowMinimum: "false" })).length > 0);
 });
 
+function allocateAt(start, overrides = {}) {
+  const firstPlayMs = Date.parse(start);
+  const record = { id: "boundary-record", videoId: "boundary-video", title: "Boundary video", channel,
+    firstPlayMs, pendingStartMs: firstPlayMs, lastEligibleAtMs: firstPlayMs + 70000,
+    durationMs: 70000, consumedMs: 0 };
+  const ledger = new api.VideoLedger();
+  return ledger.allocate(ledger.groups([record])[0], cfg(overrides), firstPlayMs + 70000,
+    { records: { put() {} }, batches: { add() {} } });
+}
+
+function inTimezone(timezone, check) {
+  const previous = process.env.TZ;
+  try { process.env.TZ = timezone; check(); }
+  finally {
+    if (previous === undefined) delete process.env.TZ;
+    else process.env.TZ = previous;
+  }
+}
+
+test("day boundary is off by default and validates strict local HH:MM values", () => {
+  assert.equal(api.CONFIG.dayBoundary, null);
+  for (const dayBoundary of [null, undefined, "00:00", "04:00", "04:30", "23:59"]) {
+    assert.deepEqual(api.validateConfig(cfg({ dayBoundary })), [], String(dayBoundary));
+  }
+  for (const dayBoundary of ["", "4:00", "04:0", "24:00", "04:60", "-1:00", "04:00:00", " 04:00", "04:00\n", 4, false, true, {}]) {
+    assert.ok(api.validateConfig(cfg({ dayBoundary })).some((error) => error.includes("dayBoundary")), String(dayBoundary));
+  }
+});
+
+test("disabled or midnight day boundary preserves the exact outgoing timestamp", () => {
+  inTimezone("UTC", () => {
+    const start = "2026-09-11T02:30:12.345Z";
+    for (const dayBoundary of [null, undefined, "00:00"]) {
+      assert.equal(allocateAt(start, { dayBoundary }).start, start);
+    }
+  });
+});
+
+test("day boundary shifts midnight through just before cutoff to previous 23:59", () => {
+  inTimezone("UTC", () => {
+    for (const start of ["2026-09-11T00:00:00.000Z", "2026-09-11T02:30:12.345Z", "2026-09-11T03:59:59.999Z"]) {
+      const batch = allocateAt(start, { dayBoundary: "04:00" });
+      assert.equal(batch.start, "2026-09-10T23:59:00.000Z", start);
+      assert.equal(batch.duration, 70);
+      assert.equal(batch.durationMs, 70000);
+      assert.equal(batch.sources[0].startMs, Date.parse(start));
+    }
+    for (const start of ["2026-09-11T04:00:00.000Z", "2026-09-11T12:00:00.000Z", "2026-09-11T23:59:59.999Z"]) {
+      assert.equal(allocateAt(start, { dayBoundary: "04:00" }).start, start);
+    }
+    assert.equal(allocateAt("2026-09-11T04:29:59.999Z", { dayBoundary: "04:30" }).start, "2026-09-10T23:59:00.000Z");
+    assert.equal(allocateAt("2026-09-11T04:30:00.000Z", { dayBoundary: "04:30" }).start, "2026-09-11T04:30:00.000Z");
+  });
+});
+
+test("day boundary uses calendar dates across month, year, and leap-day changes", () => {
+  inTimezone("UTC", () => {
+    for (const [start, expected] of [
+      ["2026-01-01T02:00:00.000Z", "2025-12-31T23:59:00.000Z"],
+      ["2026-03-01T02:00:00.000Z", "2026-02-28T23:59:00.000Z"],
+      ["2024-03-01T02:00:00.000Z", "2024-02-29T23:59:00.000Z"],
+    ]) assert.equal(allocateAt(start, { dayBoundary: "04:00" }).start, expected);
+  });
+});
+
+test("day boundary uses local time and previous-day DST offset", () => {
+  inTimezone("America/Los_Angeles", () => {
+    for (const [start, expected] of [
+      ["2026-03-08T10:30:00.000Z", "2026-03-08T07:59:00.000Z"],
+      ["2026-11-01T08:30:00.000Z", "2026-11-01T06:59:00.000Z"],
+      ["2026-11-01T09:30:00.000Z", "2026-11-01T06:59:00.000Z"],
+      ["2026-03-08T11:00:00.000Z", "2026-03-08T11:00:00.000Z"],
+    ]) assert.equal(allocateAt(start, { dayBoundary: "04:00" }).start, expected);
+  });
+  inTimezone("Asia/Kathmandu", () => {
+    assert.equal(allocateAt("2026-09-10T18:45:00.000Z", { dayBoundary: "04:00" }).start, "2026-09-10T18:14:00.000Z");
+  });
+});
+
 function discoveryFixture() {
   let data = { video_id: "current", author: "Actual creator", title: "Video title" };
   const player = { classList: { contains: () => false }, getVideoData: () => data };

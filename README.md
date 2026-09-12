@@ -18,6 +18,7 @@ Records are shared across YouTube tabs and windows in the same browser profile. 
 | `inactivityMinutes` | Close a channel after this much time without validated playback. Default: 10. |
 | `minimumDurationMinutes` | Minimum combined channel duration. Default: 1; use 0 to disable. |
 | `mergeBelowMinimum` | `true` retains short time for the same channel; `false` discards a closed channel total below the minimum. Must be a boolean. |
+| `dayBoundary` | Optional local start of day in 24-hour `"HH:MM"` format, e.g. `"04:00"`. Default: `null` (off). |
 | `maxRequestsPerHour` | Local rolling-hour attempt cap. Default: 30. |
 
 Playback can be recorded before credentials are complete. Time stays unbatched until a valid workspace/project destination is configured. An outgoing batch freezes its destination; changing configuration does not retarget existing batches.
@@ -37,6 +38,12 @@ The minimum applies **after combining videos from the same channel**. Twenty sec
 In merge mode, a below-minimum channel total stays pending until later watching of that channel reaches the minimum at a subsequent closure or Sync. In discard mode, closing that below-minimum total consumes it without uploading. Duration is rounded once after summing milliseconds; sub-second totals that round to zero remain pending in merge mode or are discarded in discard mode.
 
 A batch starts at its earliest included first-play timestamp and uses the sum of credited durations. Gaps and simultaneous playback mean its implied continuous interval may differ from the actual viewing intervals. Video records and batch membership remain available locally.
+
+With `dayBoundary: "04:00"`, a batch whose earliest included start is between midnight (inclusive) and 04:00 (exclusive) is sent with a start of **23:59:00 on the previous calendar day**. Starts at or after 04:00 keep their original timestamp. The adjustment uses the browser's local timezone when the batch is created, including daylight-saving changes; match your Toggl report timezone to it for the same date attribution. Only the outgoing start changes: recorded playback timestamps and credited duration stay intact.
+
+The earliest included start governs the entire channel batch, including batches containing videos on both sides of the cutoff. A new batch after Sync uses the start of its newly included playback. The adjusted start is frozen before delivery, so changing the option does not alter already queued entries or retries. Invalid boundary values show a configuration error and leave uploadable time unbatched until corrected.
+
+Toggl assigns entries to their start date; its support team has recorded custom day boundaries as a [feature request](https://community.toggl.com/t/feature-request-discussion-custom-end-of-day-time-for-daily-tracking/2215) and [confirmed that a pre-midnight start counts toward the previous day](https://community.toggl.com/t/tasks-completed-before-2am-should-count-towards-previous-days-goals/2639).
 
 ## Status and Sync
 

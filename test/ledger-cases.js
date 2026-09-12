@@ -260,6 +260,71 @@ globalThis.runLedgerCases = async function runLedgerCases(API) {
       "concurrent finalize cannot leave discarded time available for delivery");
   }
   results.push("cross-connection discard races with delivery claims and batch allocation");
+
+  const dayConfig = { ...config, dayBoundary: "04:00", inactivityMinutes: 120 };
+  const earlyStart = new Date(2026, 8, 11, 3, 50).getTime();
+  const laterStart = new Date(2026, 8, 11, 4, 10).getTime();
+  const previousEvening = new Date(2026, 8, 10, 23, 59).toISOString();
+  const [dayA, dayB] = await make();
+  await dayA.record(cp("early", 20000, earlyStart), dayConfig);
+  await dayB.record(cp("later", 50000, laterStart), dayConfig);
+  const closeAt = laterStart + 50000 + 120 * 60000;
+  await dayA.finalize(dayConfig, { nowMs: closeAt - 1 });
+  assert((await dayB.snapshot()).batches.length === 0, "day attribution does not change the inactivity boundary");
+  await dayA.finalize(dayConfig, { nowMs: closeAt });
+  snap = await dayB.snapshot();
+  const dayBatch = snap.batches[0];
+  assert(snap.batches.length === 1 && dayBatch.start === previousEvening && dayBatch.duration === 70 && dayBatch.durationMs === 70000,
+    "same-channel batch shifts its earliest included start while retaining all summed playback");
+  assert(snap.records.find(record => record.id === "early").firstPlayMs === earlyStart &&
+    snap.records.find(record => record.id === "later").firstPlayMs === laterStart &&
+    dayBatch.sources.find(source => source.recordId === "early").startMs === earlyStart &&
+    dayBatch.sources.find(source => source.recordId === "later").startMs === laterStart,
+    "day attribution preserves original viewing and source timestamps");
+  const daySources = JSON.stringify(dayBatch.sources);
+  const offConfig = { ...dayConfig, dayBoundary: null };
+  await dayB.finalize(offConfig, { force: true, nowMs: closeAt });
+  let dayNow = closeAt + 10000;
+  const dayRequests = [];
+  const dayWorker = new TogglWorker(dayB, offConfig, { locks, now: () => dayNow,
+    sleep: async ms => { dayNow += ms; }, send: async (entry, destination) => {
+      dayRequests.push(API.buildTogglRequest(entry, destination).body);
+      return dayRequests.length === 1 ? { type: "timeout" }
+        : { type: "response", status: 200, responseText: '{"id":77}' };
+    } });
+  await dayWorker.kick();
+  assert((await dayA.snapshot()).batches[0].status === "uncertain", "shifted interrupted delivery still requires explicit retry");
+  assert(await dayA.retry(dayBatch.id), "shifted uncertain batch can be explicitly retried");
+  await dayWorker.kick();
+  snap = await dayA.snapshot();
+  assert(dayRequests.length === 2 && dayRequests.every(body => body.start === previousEvening && body.duration === 70) &&
+    snap.batches[0].status === "sent" && snap.batches[0].start === previousEvening && JSON.stringify(snap.batches[0].sources) === daySources,
+    "configuration changes and retry preserve the frozen shifted start, duration, and membership through delivery");
+  const prefixStart = new Date(2026, 8, 11, 7, 0).getTime();
+  await dayA.record({ ...cp("early", 80000, earlyStart), intervalStartMs: prefixStart,
+    lastEligibleAtMs: prefixStart + 60000 }, dayConfig);
+  await dayA.finalize(dayConfig, { force: true, nowMs: prefixStart + 60000 });
+  const prefixBatch = (await dayB.snapshot()).batches.find(batch => batch.id !== dayBatch.id);
+  assert(prefixBatch.start === new Date(prefixStart).toISOString() && prefixBatch.duration === 60 &&
+    prefixBatch.sources[0].startMs === prefixStart,
+    "post-consumption playback uses its new pending start after the cutoff instead of the video's original early start");
+  results.push("local day attribution at allocation, original timestamps, frozen delivery/retry, fresh prefix starts");
+
+  const [invalidDay] = await make();
+  const invalidDayConfig = { ...dayConfig, dayBoundary: "24:00" };
+  await invalidDay.record(cp("invalid-day", 60000, earlyStart), invalidDayConfig);
+  await invalidDay.finalize(invalidDayConfig, { force: true, nowMs: closeAt });
+  snap = await invalidDay.snapshot();
+  assert(snap.batches.length === 0 && snap.pendingChannels[0].durationMs === 60000 && snap.records[0].consumedMs === 0,
+    "invalid day boundary cannot freeze or consume uploadable credit");
+  await invalidDay.record(cp("invalid-day", 90000, earlyStart), invalidDayConfig);
+  await invalidDay.finalize(dayConfig, { force: true, nowMs: closeAt });
+  snap = await invalidDay.snapshot();
+  assert(snap.batches.length === 1 && snap.batches[0].start === previousEvening && snap.batches[0].duration === 90 &&
+    snap.pendingChannels.length === 0,
+    "recording continues during invalid day configuration and correction freezes all retained credit");
+  results.push("invalid day configuration retains playback until corrected");
+
   if (globalThis.navigator?.locks) {
     const [parallelA, parallelB] = await make();
     await parallelA.record(cp("p1", 60000), config); await parallelB.record(cp("p2", 60000, 100000, "B"), config);
