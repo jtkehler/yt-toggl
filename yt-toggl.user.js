@@ -1,16 +1,11 @@
 // ==UserScript==
 // @name         YouTube Watch Time → Toggl
 // @namespace    https://github.com/local/yt-toggl
-// @version      1.0.1
+// @version      2.0.0
 // @description  Track eligible YouTube playback locally and create completed Toggl entries.
 // @author       You
 // @match        https://www.youtube.com/*
 // @noframes
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_deleteValue
-// @grant        GM_listValues
-// @grant        GM_addValueChangeListener
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      api.track.toggl.com
@@ -42,28 +37,12 @@ function makeDescription(channel) {
   "use strict";
 
   const SCRIPT_ID = "yt-toggl";
-  const SCHEMA_VERSION = 1;
-  const TAB_ID_SESSION_KEY = "yt-toggl:tab-id:v1";
-  const TAB_KEY_PREFIX = "yt-toggl:tab:v1:";
-  const QUEUE_KEY = "yt-toggl:queue:v1";
-  const ATTEMPTS_KEY = "yt-toggl:attempts:v1";
-  const LAST_REQUEST_KEY = "yt-toggl:last-request:v1";
-  const QUOTA_KEY = "yt-toggl:quota:v1";
-  const AUTH_BLOCK_KEY = "yt-toggl:auth-block:v1";
-  const ERRORS_KEY = "yt-toggl:errors:v1";
-  const COMMAND_KEY = "yt-toggl:command:v1";
-  const INSTANCE_PROBE_KEY = "yt-toggl:instance-probe:v1";
-  const CARRY_TRANSFER_KEY = "yt-toggl:carry-transfer:v1";
-  const LOCK_KEY_PREFIX = "yt-toggl:lease:v1:";
-  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const ONE_HOUR_MS = 3600000;
   const REQUEST_SPACING_MS = 1000;
-  const DEFAULT_RATE_BACKOFF_MS = 2 * 60 * 1000;
-  const REQUEST_TIMEOUT_MS = 30 * 1000;
+  const DEFAULT_RATE_BACKOFF_MS = 120000;
+  const REQUEST_TIMEOUT_MS = 30000;
   const TICK_INTERVAL_MS = 1000;
-  const TAB_HEARTBEAT_GRACE_MS = 5 * TICK_INTERVAL_MS;
-  const WORKER_INTERVAL_MS = 30 * 1000;
-  const MAX_ERROR_HISTORY = 12;
-  const LOCK_UNAVAILABLE = Symbol("lock-unavailable");
+  const WORKER_INTERVAL_MS = 30000;
 
   function clone(value) {
     if (value === undefined) return undefined;
@@ -129,92 +108,6 @@ function makeDescription(channel) {
     return `${prefix}-${nowMs.toString(36)}-${randomPart}`;
   }
 
-  function normalizeCarry(carry) {
-    const parts = Array.isArray(carry && carry.parts) ? carry.parts : [];
-    const seen = new Set();
-    return {
-      parts: parts
-        .filter(
-          (part) =>
-            part &&
-            typeof part.id === "string" &&
-            normalizedText(part.id) &&
-            finiteNumber(part.durationMs) > 0,
-        )
-        .filter((part) => {
-          if (seen.has(part.id)) return false;
-          seen.add(part.id);
-          return true;
-        })
-        .map((part) => ({
-          id: part.id,
-          durationMs: nonNegativeNumber(part.durationMs),
-          sourceTabId: normalizedText(part.sourceTabId),
-          createdAtMs: nonNegativeNumber(part.createdAtMs),
-        })),
-    };
-  }
-
-  function carryDurationMs(carry) {
-    return normalizeCarry(carry).parts.reduce((total, part) => total + part.durationMs, 0);
-  }
-
-  function mergeCarry(targetCarry, sourceCarry) {
-    return normalizeCarry({
-      parts: [...normalizeCarry(targetCarry).parts, ...normalizeCarry(sourceCarry).parts],
-    });
-  }
-
-  function normalizeActive(active) {
-    if (!active || typeof active !== "object") return null;
-    const channel = normalizeChannel(active.channel);
-    if (!channel || typeof active.id !== "string") return null;
-    return {
-      id: active.id,
-      channel,
-      firstPlayMs: nonNegativeNumber(active.firstPlayMs),
-      lastEligibleAtMs: nonNegativeNumber(active.lastEligibleAtMs),
-      durationMs: nonNegativeNumber(active.durationMs),
-    };
-  }
-
-  function createTabRecord(tabId, nowMs = Date.now()) {
-    return {
-      schemaVersion: SCHEMA_VERSION,
-      tabId,
-      heartbeatMs: nowMs,
-      instanceId: "",
-      active: null,
-      carry: { parts: [] },
-      lastCommandId: "",
-      recoveredAtMs: 0,
-    };
-  }
-
-  function normalizeTabRecord(record, tabId = "", nowMs = Date.now()) {
-    const base = record && typeof record === "object" ? record : {};
-    return {
-      schemaVersion: SCHEMA_VERSION,
-      tabId: normalizedText(base.tabId) || tabId,
-      heartbeatMs: nonNegativeNumber(base.heartbeatMs, nowMs),
-      instanceId: normalizedText(base.instanceId),
-      active: normalizeActive(base.active),
-      carry: normalizeCarry(base.carry),
-      lastCommandId: normalizedText(base.lastCommandId),
-      recoveredAtMs: nonNegativeNumber(base.recoveredAtMs),
-    };
-  }
-
-  function makeSession(channel, nowMs, idFactory = randomId) {
-    return {
-      id: idFactory("session", nowMs),
-      channel: normalizeChannel(channel),
-      firstPlayMs: nowMs,
-      lastEligibleAtMs: nowMs,
-      durationMs: 0,
-    };
-  }
-
   function playedRangeCovers(ranges, fromSeconds, toSeconds) {
     if (!Array.isArray(ranges) || ranges.length === 0) return true;
     const low = Math.min(fromSeconds, toSeconds);
@@ -257,254 +150,6 @@ function makeDescription(channel) {
     return Math.max(0, Math.min(wallMs, progressEquivalentMs));
   }
 
-  function playbackBridgesInactivity(previous, current, creditedMs, expirationMs) {
-    if (!previous || creditedMs <= 0) return false;
-    const wallElapsedMs = Math.max(0, current.nowMs - previous.nowMs);
-    const monotonicElapsedMs = Math.max(0, current.monotonicMs - previous.monotonicMs);
-    return (
-      wallElapsedMs - creditedMs < expirationMs &&
-      monotonicElapsedMs - creditedMs < expirationMs
-    );
-  }
-
-  function makeQueueEntry(session, totalDurationMs, reason, nowMs, descriptionFn = makeDescription) {
-    return {
-      schemaVersion: SCHEMA_VERSION,
-      id: `entry:${session.id}`,
-      sourceSessionId: session.id,
-      sourceTabId: "",
-      channel: clone(session.channel),
-      description: normalizedText(descriptionFn(session.channel)) || "YouTube",
-      start: new Date(session.firstPlayMs).toISOString(),
-      duration: Math.max(1, Math.round(totalDurationMs / 1000)),
-      reason,
-      queuedAtMs: nowMs,
-      status: "pending",
-      nextAttemptAtMs: 0,
-      attemptCount: 0,
-      sendingSinceMs: 0,
-      lastError: "",
-    };
-  }
-
-  function finalizeTabRecord(
-    inputRecord,
-    config = CONFIG,
-    descriptionFn = makeDescription,
-    reason = "finalized",
-    nowMs = Date.now(),
-  ) {
-    const record = normalizeTabRecord(inputRecord, inputRecord && inputRecord.tabId, nowMs);
-    const session = record.active;
-    record.active = null;
-    if (!session || session.durationMs <= 0) return { record, entry: null, disposition: "empty" };
-
-    const minimumMs = minimumDurationMs(config);
-    if (!config.mergeBelowMinimum) {
-      if (session.durationMs < minimumMs) {
-        return { record, entry: null, disposition: "discarded" };
-      }
-      const entry = makeQueueEntry(session, session.durationMs, reason, nowMs, descriptionFn);
-      entry.sourceTabId = record.tabId;
-      return { record, entry, disposition: "queued" };
-    }
-
-    const existingCarry = normalizeCarry(record.carry);
-    const combinedDurationMs = carryDurationMs(existingCarry) + session.durationMs;
-    if (combinedDurationMs < minimumMs) {
-      record.carry = mergeCarry(existingCarry, {
-        parts: [
-          {
-            id: session.id,
-            durationMs: session.durationMs,
-            sourceTabId: record.tabId,
-            createdAtMs: nowMs,
-          },
-        ],
-      });
-      return { record, entry: null, disposition: "carried" };
-    }
-
-    const entry = makeQueueEntry(session, combinedDurationMs, reason, nowMs, descriptionFn);
-    entry.sourceTabId = record.tabId;
-    record.carry = { parts: [] };
-    return { record, entry, disposition: "queued" };
-  }
-
-  class SessionMachine {
-    constructor(config = CONFIG, record = null, options = {}) {
-      this.config = config;
-      this.descriptionFn = options.descriptionFn || makeDescription;
-      this.idFactory = options.idFactory || randomId;
-      this.record = normalizeTabRecord(record, (record && record.tabId) || "test-tab");
-      this.sample = null;
-      this.inactivityDeadline = options.inactivityDeadline || null;
-    }
-
-    resetInactivityDeadline(snapshot) {
-      if (!this.record.active) {
-        this.inactivityDeadline = null;
-        return;
-      }
-      const expirationMs = inactivityMs(this.config);
-      this.inactivityDeadline = {
-        sessionId: this.record.active.id,
-        atMonotonicMs: snapshot.monotonicMs + expirationMs,
-        atWallMs: snapshot.nowMs + expirationMs,
-        lastObservedWallMs: snapshot.nowMs,
-      };
-    }
-
-    ensureInactivityDeadline(snapshot) {
-      if (!this.record.active) {
-        this.inactivityDeadline = null;
-        return null;
-      }
-      const hasMonotonicDeadline = Boolean(
-        this.inactivityDeadline &&
-          this.inactivityDeadline.sessionId === this.record.active.id &&
-          Number.isFinite(this.inactivityDeadline.atMonotonicMs),
-      );
-      if (!hasMonotonicDeadline) {
-        const expirationMs = inactivityMs(this.config);
-        const wallElapsedMs = Math.max(0, snapshot.nowMs - this.record.active.lastEligibleAtMs);
-        const remainingMs = Math.max(0, expirationMs - wallElapsedMs);
-        this.inactivityDeadline = {
-          sessionId: this.record.active.id,
-          atMonotonicMs: snapshot.monotonicMs + remainingMs,
-          atWallMs: snapshot.nowMs + remainingMs,
-          lastObservedWallMs: snapshot.nowMs,
-        };
-        this.record.active.lastEligibleAtMs = Math.max(
-          0,
-          this.inactivityDeadline.atWallMs - expirationMs,
-        );
-      } else {
-        if (!Number.isFinite(this.inactivityDeadline.atWallMs)) {
-          const expirationMs = inactivityMs(this.config);
-          const wallElapsedMs = Math.max(0, snapshot.nowMs - this.record.active.lastEligibleAtMs);
-          const wallRemainingMs = Math.max(0, expirationMs - wallElapsedMs);
-          const monotonicRemainingMs = Math.max(
-            0,
-            this.inactivityDeadline.atMonotonicMs - snapshot.monotonicMs,
-          );
-          this.inactivityDeadline.atWallMs =
-            snapshot.nowMs + Math.min(wallRemainingMs, monotonicRemainingMs);
-        }
-        if (!Number.isFinite(this.inactivityDeadline.lastObservedWallMs)) {
-          this.inactivityDeadline.lastObservedWallMs = snapshot.nowMs;
-        }
-        if (snapshot.nowMs < this.inactivityDeadline.lastObservedWallMs) {
-          const monotonicRemainingMs = Math.max(
-            0,
-            this.inactivityDeadline.atMonotonicMs - snapshot.monotonicMs,
-          );
-          this.inactivityDeadline.atWallMs = snapshot.nowMs + monotonicRemainingMs;
-          // Persist the equivalent wall anchor so reload/closed-tab recovery
-          // retains elapsed inactivity after this in-memory deadline is lost.
-          this.record.active.lastEligibleAtMs = Math.max(
-            0,
-            this.inactivityDeadline.atWallMs - inactivityMs(this.config),
-          );
-        }
-        this.inactivityDeadline.lastObservedWallMs = snapshot.nowMs;
-      }
-      return this.inactivityDeadline;
-    }
-
-    startSession(channel, snapshot, initialDurationMs = 0) {
-      const durationMs = nonNegativeNumber(initialDurationMs);
-      this.record.active = makeSession(
-        channel,
-        Math.max(0, snapshot.nowMs - durationMs),
-        this.idFactory,
-      );
-      this.record.active.durationMs = durationMs;
-      this.record.active.lastEligibleAtMs = snapshot.nowMs;
-      this.resetInactivityDeadline(snapshot);
-    }
-
-    finalize(reason, nowMs) {
-      const result = finalizeTabRecord(this.record, this.config, this.descriptionFn, reason, nowMs);
-      this.record = result.record;
-      this.sample = null;
-      this.inactivityDeadline = null;
-      return result.entry;
-    }
-
-    tick(rawSnapshot) {
-      const snapshot = normalizeSnapshot(rawSnapshot);
-      const entries = [];
-
-      if (
-        this.record.active &&
-        snapshot.channel &&
-        !channelsEqual(this.record.active.channel, snapshot.channel)
-      ) {
-        const entry = this.finalize("channel-change", snapshot.nowMs);
-        if (entry) entries.push(entry);
-      }
-
-      const inactivityDeadline = this.ensureInactivityDeadline(snapshot);
-      const deadlineReached = Boolean(
-        inactivityDeadline &&
-          (snapshot.monotonicMs >= inactivityDeadline.atMonotonicMs ||
-            snapshot.nowMs >= inactivityDeadline.atWallMs),
-      );
-      const creditedMs =
-        this.record.active && this.sample && snapshot.channel
-          ? validatedPlaybackMs(this.sample, snapshot)
-          : 0;
-      const playbackBridgesDeadline =
-        deadlineReached &&
-        playbackBridgesInactivity(
-          this.sample,
-          snapshot,
-          creditedMs,
-          inactivityMs(this.config),
-        );
-
-      let creditedReplacement = false;
-      if (deadlineReached && !playbackBridgesDeadline) {
-        const entry = this.finalize("inactivity", snapshot.nowMs);
-        if (entry) entries.push(entry);
-        if (creditedMs > 0 && snapshot.channel) {
-          this.startSession(snapshot.channel, snapshot, creditedMs);
-          creditedReplacement = true;
-        }
-      }
-
-      if (this.record.active && creditedMs > 0 && !creditedReplacement) {
-        this.record.active.durationMs += creditedMs;
-        this.record.active.lastEligibleAtMs = snapshot.nowMs;
-        this.record.active.channel = mergeChannel(this.record.active.channel, snapshot.channel);
-        this.resetInactivityDeadline(snapshot);
-      }
-
-      if (snapshot.eligible && snapshot.channel) {
-        if (!this.record.active) this.startSession(snapshot.channel, snapshot);
-        else this.record.active.channel = mergeChannel(this.record.active.channel, snapshot.channel);
-      }
-
-      this.sample = snapshot.channel && snapshot.mediaKey ? snapshot : null;
-      return entries;
-    }
-
-    sync(rawSnapshot) {
-      const snapshot = normalizeSnapshot(rawSnapshot);
-      const entries = this.tick(snapshot);
-      if (this.record.active) {
-        const entry = this.finalize("manual-sync", snapshot.nowMs);
-        if (entry) entries.push(entry);
-      }
-      if (snapshot.eligible && snapshot.channel) {
-        this.startSession(snapshot.channel, snapshot);
-        this.sample = snapshot;
-      }
-      return entries;
-    }
-  }
-
   function normalizeSnapshot(snapshot) {
     const input = snapshot && typeof snapshot === "object" ? snapshot : {};
     const nowMs = nonNegativeNumber(input.nowMs, Date.now());
@@ -514,7 +159,9 @@ function makeDescription(channel) {
       eligible: Boolean(input.eligible),
       progressAllowed: Boolean(input.progressAllowed),
       channel: normalizeChannel(input.channel),
-      mediaKey: normalizedText(input.mediaKey),
+      mediaKey: normalizedText(input.mediaKey || input.videoId),
+      videoId: normalizedText(input.videoId || input.mediaKey),
+      title: normalizedText(input.title),
       mediaTime: finiteNumber(input.mediaTime),
       playbackRate: finiteNumber(input.playbackRate, 1),
       playedRanges: Array.isArray(input.playedRanges) ? clone(input.playedRanges) : [],
@@ -522,188 +169,61 @@ function makeDescription(channel) {
     };
   }
 
-  function recoverExpiredRecord(record, nowMs, config = CONFIG, descriptionFn = makeDescription) {
-    const normalized = normalizeTabRecord(record, record && record.tabId, nowMs);
-    if (!normalized.active) return { record: normalized, entry: null, disposition: "unchanged" };
-    if (nowMs - normalized.active.lastEligibleAtMs < inactivityMs(config)) {
-      return { record: normalized, entry: null, disposition: "unchanged" };
-    }
-    const result = finalizeTabRecord(normalized, config, descriptionFn, "recovered-inactivity", nowMs);
-    result.record.recoveredAtMs = nowMs;
-    return result;
-  }
-
-  function tabRecordIsPrunable(record, currentTabId, nowMs, config = CONFIG) {
-    const normalized = normalizeTabRecord(record, record && record.tabId, nowMs);
-    return Boolean(
-      normalized.tabId &&
-        normalized.tabId !== currentTabId &&
-        !normalized.active &&
-        carryDurationMs(normalized.carry) === 0 &&
-        nowMs - normalized.heartbeatMs >= inactivityMs(config),
-    );
-  }
-
-  function attachCarry(targetRecord, sourceRecord, nowMs = Date.now()) {
-    const target = normalizeTabRecord(targetRecord, targetRecord && targetRecord.tabId, nowMs);
-    const source = normalizeTabRecord(sourceRecord, sourceRecord && sourceRecord.tabId, nowMs);
-    target.carry = mergeCarry(target.carry, source.carry);
-    source.carry = { parts: [] };
-    return { target, source };
-  }
-
-  function discardCarry(record, nowMs = Date.now()) {
-    const next = normalizeTabRecord(record, record && record.tabId, nowMs);
-    next.carry = { parts: [] };
-    return next;
-  }
-
-  function normalizeCarryTransfer(transfer) {
-    if (!transfer || typeof transfer !== "object" || transfer.schemaVersion !== 1) return null;
-    const id = normalizedText(transfer.id);
-    const sourceTabId = normalizedText(transfer.sourceTabId);
-    const targetTabId = normalizedText(transfer.targetTabId);
-    const rawParts = Array.isArray(transfer.parts) ? transfer.parts : [];
-    const parts = normalizeCarry({ parts: rawParts }).parts;
-    const partsHaveStableIds = rawParts.every(
-      (part) =>
-        part &&
-        typeof part.id === "string" &&
-        part.id === normalizedText(part.id),
-    );
-    if (
-      !id ||
-      !sourceTabId ||
-      !targetTabId ||
-      sourceTabId === targetTabId ||
-      parts.length === 0 ||
-      parts.length !== rawParts.length ||
-      !partsHaveStableIds
-    ) {
-      return null;
-    }
-    return {
-      schemaVersion: 1,
-      id,
-      sourceTabId,
-      targetTabId,
-      parts,
-      createdAtMs: nonNegativeNumber(transfer.createdAtMs),
-      targetInstanceId: normalizedText(transfer.targetInstanceId),
-    };
-  }
-
-  function createCarryTransfer(
-    sourceRecord,
-    targetTabId,
-    targetInstanceId,
-    nowMs = Date.now(),
-    idFactory = randomId,
-  ) {
-    const source = normalizeTabRecord(sourceRecord, sourceRecord && sourceRecord.tabId, nowMs);
-    const normalizedTargetTabId = normalizedText(targetTabId);
-    const parts = normalizeCarry(source.carry).parts;
-    if (!source.tabId || !normalizedTargetTabId || source.tabId === normalizedTargetTabId || !parts.length) {
-      return null;
-    }
-    return {
-      schemaVersion: 1,
-      id: idFactory("carry-transfer", nowMs),
-      sourceTabId: source.tabId,
-      targetTabId: normalizedTargetTabId,
-      parts,
-      createdAtMs: nowMs,
-      targetInstanceId: normalizedText(targetInstanceId),
-    };
-  }
-
-  function carryTransferIssue(rawTransfer) {
-    if (rawTransfer === null || rawTransfer === undefined || normalizeCarryTransfer(rawTransfer)) {
-      return null;
-    }
-    const unsupportedSchema = Boolean(
-      rawTransfer &&
-        typeof rawTransfer === "object" &&
-        Object.prototype.hasOwnProperty.call(rawTransfer, "schemaVersion") &&
-        rawTransfer.schemaVersion !== 1,
-    );
-    return {
-      status: "unreadable",
-      kind: unsupportedSchema ? "unsupported-schema" : "malformed",
-      fingerprint: JSON.stringify(rawTransfer),
-      rawTransfer,
-    };
-  }
-
-  function completeCarryTransfer(store) {
-    const rawTransfer = store.get(CARRY_TRANSFER_KEY, null);
-    if (rawTransfer === null || rawTransfer === undefined) return null;
-    const transfer = normalizeCarryTransfer(rawTransfer);
-    if (!transfer) {
-      return carryTransferIssue(rawTransfer);
+  // A sampler owns only its baseline. Persisted credit belongs to the video ledger.
+  class PlaybackRecorder {
+    constructor(config = CONFIG, { idFactory = randomId } = {}) {
+      this.config = config;
+      this.idFactory = idFactory;
+      this.reset();
     }
 
-    const target = normalizeTabRecord(
-      store.get(tabStorageKey(transfer.targetTabId), null),
-      transfer.targetTabId,
-      transfer.createdAtMs,
-    );
-    target.carry = mergeCarry(target.carry, { parts: transfer.parts });
-    target.heartbeatMs = Math.max(target.heartbeatMs, transfer.createdAtMs);
-    if (!target.instanceId) target.instanceId = transfer.targetInstanceId;
-    store.set(tabStorageKey(transfer.targetTabId), target);
-
-    const transferredIds = new Set(transfer.parts.map((part) => part.id));
-    const source = normalizeTabRecord(
-      store.get(tabStorageKey(transfer.sourceTabId), null),
-      transfer.sourceTabId,
-      transfer.createdAtMs,
-    );
-    source.carry = normalizeCarry({
-      parts: source.carry.parts.filter((part) => !transferredIds.has(part.id)),
-    });
-    store.set(tabStorageKey(transfer.sourceTabId), source);
-
-    // Initial versions could leave a part in both records if attachment was
-    // interrupted between their writes. A new explicit transfer designates one
-    // owner, so remove any still-carried legacy copies everywhere else.
-    for (const key of store.keys()) {
-      const tabId = tabIdFromStorageKey(key);
-      if (!tabId || tabId === transfer.targetTabId || tabId === transfer.sourceTabId) continue;
-      const record = normalizeTabRecord(store.get(key, null), tabId, transfer.createdAtMs);
-      const parts = record.carry.parts.filter((part) => !transferredIds.has(part.id));
-      if (parts.length === record.carry.parts.length) continue;
-      record.carry = normalizeCarry({ parts });
-      store.set(key, record);
+    reset() {
+      this.sample = null;
+      this.record = null;
+      this.creditedMs = 0;
+      this.isTracking = false;
+      this.lastProgressMonotonicMs = null;
     }
 
-    store.delete(CARRY_TRANSFER_KEY);
-    return { transfer, target, source };
-  }
-
-  function discardCarryTransferJournal(store, expectedFingerprint) {
-    const rawTransfer = store.get(CARRY_TRANSFER_KEY, null);
-    if (rawTransfer === null || rawTransfer === undefined) return false;
-    const issue = carryTransferIssue(rawTransfer);
-    if (!issue) {
-      throw new Error("The saved carry transfer is now readable and was not discarded.");
+    observe(rawSnapshot) {
+      const snapshot = normalizeSnapshot(rawSnapshot);
+      const previous = this.sample;
+      const sameVideo = this.record && this.record.videoId === snapshot.mediaKey &&
+        channelsEqual(this.record.channel, snapshot.channel);
+      const credit = sameVideo ? validatedPlaybackMs(previous, snapshot) : 0;
+      const intervalStartMs = Math.max(0, snapshot.nowMs - credit);
+      const expiration = inactivityMs(this.config);
+      const expired = sameVideo && credit > 0 && this.record.durationMs > 0 && (
+        intervalStartMs - this.record.lastEligibleAtMs >= expiration ||
+        snapshot.monotonicMs - credit - this.lastProgressMonotonicMs >= expiration
+      );
+      if (!sameVideo || expired) {
+        this.record = snapshot.channel && snapshot.mediaKey && (snapshot.eligible || credit > 0) ? {
+          id: this.idFactory("viewing"), videoId: snapshot.mediaKey, title: snapshot.title,
+          channel: snapshot.channel, firstPlayMs: intervalStartMs,
+          lastEligibleAtMs: snapshot.nowMs, durationMs: 0, intervalStartMs,
+        } : null;
+      }
+      let checkpoint = null;
+      if (credit > 0 && this.record) {
+        if (this.record.durationMs === 0) this.record.firstPlayMs = intervalStartMs;
+        this.record.durationMs += credit;
+        this.record.intervalStartMs = intervalStartMs;
+        this.record.lastEligibleAtMs = snapshot.nowMs;
+        this.record.title = snapshot.title || this.record.title;
+        this.record.channel = mergeChannel(this.record.channel, snapshot.channel);
+        this.lastProgressMonotonicMs = snapshot.monotonicMs;
+        checkpoint = clone(this.record);
+      }
+      // Events can repeat the exact sample; retain the indicator only until the
+      // next actual observation interval proves a stall or ineligible state.
+      const repeated = previous && previous.monotonicMs === snapshot.monotonicMs &&
+        previous.mediaKey === snapshot.mediaKey;
+      this.isTracking = Boolean(snapshot.eligible && (credit > 0 || (repeated && this.isTracking)));
+      this.creditedMs = credit;
+      this.sample = snapshot.channel && snapshot.mediaKey ? snapshot : null;
+      return { checkpoint, creditedMs: credit };
     }
-    if (issue.fingerprint !== expectedFingerprint) {
-      throw new Error("The saved carry transfer changed and was not discarded.");
-    }
-    store.delete(CARRY_TRANSFER_KEY);
-    return true;
-  }
-
-  function beginCarryTransfer(store, transfer) {
-    const normalized = normalizeCarryTransfer(transfer);
-    if (!normalized) throw new Error("Cannot start an invalid carry transfer.");
-    const existing = store.get(CARRY_TRANSFER_KEY, null);
-    if (existing !== null && existing !== undefined) {
-      throw new Error("Another carry transfer must be recovered before starting a new one.");
-    }
-    store.set(CARRY_TRANSFER_KEY, normalized);
-    return completeCarryTransfer(store);
   }
 
   function validateConfig(config = CONFIG) {
@@ -727,6 +247,7 @@ function makeDescription(channel) {
     if (!Number.isInteger(Number(config.maxRequestsPerHour)) || Number(config.maxRequestsPerHour) <= 0) {
       errors.push("CONFIG.maxRequestsPerHour must be a positive integer.");
     }
+    if (typeof config.mergeBelowMinimum !== "boolean") errors.push("CONFIG.mergeBelowMinimum must be a boolean.");
     return errors;
   }
 
@@ -746,15 +267,15 @@ function makeDescription(channel) {
 
   function buildTogglRequest(entry, config = CONFIG) {
     const body = {
-      workspace_id: Number(config.togglWorkspaceId),
+      workspace_id: Number(entry.workspaceId),
       created_with: SCRIPT_ID,
       description: entry.description,
       start: entry.start,
       duration: Math.max(1, Math.round(finiteNumber(entry.duration))),
     };
-    if (config.togglProjectId !== null) body.project_id = Number(config.togglProjectId);
+    if (entry.projectId !== null) body.project_id = Number(entry.projectId);
     return {
-      url: `https://api.track.toggl.com/api/v9/workspaces/${Number(config.togglWorkspaceId)}/time_entries`,
+      url: `https://api.track.toggl.com/api/v9/workspaces/${Number(entry.workspaceId)}/time_entries`,
       body,
     };
   }
@@ -879,7 +400,7 @@ function makeDescription(channel) {
   function rollingAttemptWindow(attempts, nowMs, maximum) {
     const recent = (Array.isArray(attempts) ? attempts : [])
       .map((value) => finiteNumber(value))
-      .filter((value) => value > nowMs - ONE_HOUR_MS && value <= nowMs)
+      .filter((value) => value > nowMs - ONE_HOUR_MS)
       .sort((a, b) => a - b);
     const limit = Math.max(1, Math.floor(finiteNumber(maximum, 30)));
     return {
@@ -892,65 +413,6 @@ function makeDescription(channel) {
   function requestSpacingDelay(lastRequestAtMs, nowMs) {
     const elapsedMs = Math.max(0, nowMs - nonNegativeNumber(lastRequestAtMs));
     return Math.max(0, REQUEST_SPACING_MS - elapsedMs);
-  }
-
-  function normalizeQueue(queue) {
-    const entries = Array.isArray(queue) ? queue : [];
-    const seen = new Set();
-    return entries
-      .filter((entry) => {
-        if (!entry || typeof entry.id !== "string" || !entry.id || seen.has(entry.id)) return false;
-        seen.add(entry.id);
-        return true;
-      })
-      .map((entry) => {
-        return {
-          schemaVersion: SCHEMA_VERSION,
-          id: entry.id,
-          sourceSessionId: normalizedText(entry.sourceSessionId),
-          sourceTabId: normalizedText(entry.sourceTabId),
-          channel: normalizeChannel(entry.channel),
-          description: normalizedText(entry.description) || "YouTube",
-          start: entry.start,
-          duration: Math.max(1, Math.round(finiteNumber(entry.duration, 1))),
-          reason: normalizedText(entry.reason),
-          queuedAtMs: nonNegativeNumber(entry.queuedAtMs),
-          status: ["pending", "sending", "uncertain", "blocked"].includes(entry.status)
-            ? entry.status
-            : "pending",
-          nextAttemptAtMs: nonNegativeNumber(entry.nextAttemptAtMs),
-          attemptCount: nonNegativeNumber(entry.attemptCount),
-          sendingSinceMs: nonNegativeNumber(entry.sendingSinceMs),
-          lastError: normalizedText(entry.lastError),
-        };
-      });
-  }
-
-  function enqueueUnique(queue, entries) {
-    const next = normalizeQueue(queue);
-    const ids = new Set(next.map((entry) => entry.id));
-    for (const rawEntry of entries || []) {
-      const normalized = normalizeQueue([rawEntry])[0];
-      if (normalized && !ids.has(normalized.id)) {
-        ids.add(normalized.id);
-        next.push(normalized);
-      }
-    }
-    return next;
-  }
-
-  function markInterruptedRequestsUncertain(queue) {
-    return normalizeQueue(queue).map((entry) =>
-      entry.status === "sending"
-        ? {
-            ...entry,
-            status: "uncertain",
-            sendingSinceMs: 0,
-            lastError:
-              "The page closed while this Toggl create request was in flight. Check Toggl before retrying.",
-          }
-        : entry,
-    );
   }
 
   function closestTrackablePlayer(video) {
@@ -1001,125 +463,6 @@ function makeDescription(channel) {
     });
   }
 
-  class GMStore {
-    get(key, fallback) {
-      return clone(GM_getValue(key, fallback));
-    }
-
-    set(key, value) {
-      GM_setValue(key, clone(value));
-    }
-
-    delete(key) {
-      GM_deleteValue(key);
-    }
-
-    keys() {
-      return GM_listValues();
-    }
-  }
-
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
-  }
-
-  async function withCrossTabLock(store, name, callback, options = {}) {
-    const lockName = `yt-toggl:${name}`;
-    if (typeof navigator !== "undefined" && navigator.locks && navigator.locks.request) {
-      const lockOptions = options.ifAvailable ? { ifAvailable: true } : {};
-      return navigator.locks.request(lockName, lockOptions, (lock) => {
-        if (!lock) return LOCK_UNAVAILABLE;
-        return callback();
-      });
-    }
-
-    const owner = randomId("lock");
-    const key = `${LOCK_KEY_PREFIX}${name}`;
-    const leaseMs = options.leaseMs || 90 * 1000;
-    const deadlineMs = Date.now() + (options.ifAvailable ? 0 : 5000);
-    do {
-      const nowMs = Date.now();
-      const existing = store.get(key, null);
-      if (!existing || finiteNumber(existing.expiresAtMs) <= nowMs || existing.owner === owner) {
-        store.set(key, { owner, expiresAtMs: nowMs + leaseMs });
-        await sleep(40 + Math.floor(Math.random() * 40));
-        const confirmed = store.get(key, null);
-        if (confirmed && confirmed.owner === owner) {
-          try {
-            return await callback();
-          } finally {
-            const current = store.get(key, null);
-            if (current && current.owner === owner) store.delete(key);
-          }
-        }
-      }
-      if (options.ifAvailable) return LOCK_UNAVAILABLE;
-      await sleep(50 + Math.floor(Math.random() * 75));
-    } while (Date.now() <= deadlineMs);
-    throw new Error(`Could not acquire cross-tab lock: ${name}`);
-  }
-
-  class SharedQueue {
-    constructor(store) {
-      this.store = store;
-    }
-
-    get() {
-      return normalizeQueue(this.store.get(QUEUE_KEY, []));
-    }
-
-    async mutate(callback) {
-      return withCrossTabLock(this.store, "queue", () => {
-        const current = this.get();
-        const next = normalizeQueue(callback(current) || current);
-        this.store.set(QUEUE_KEY, next);
-        return next;
-      });
-    }
-
-    async add(entries) {
-      if (!entries || entries.length === 0) return this.get();
-      return this.mutate((queue) => enqueueUnique(queue, entries));
-    }
-
-    async update(id, callback) {
-      return this.mutate((queue) =>
-        queue.map((entry) => (entry.id === id ? { ...entry, ...callback(clone(entry)) } : entry)),
-      );
-    }
-
-    async remove(id) {
-      return this.mutate((queue) => queue.filter((entry) => entry.id !== id));
-    }
-  }
-
-  function tabStorageKey(tabId) {
-    return `${TAB_KEY_PREFIX}${tabId}`;
-  }
-
-  function tabIdFromStorageKey(key) {
-    return key.startsWith(TAB_KEY_PREFIX) ? key.slice(TAB_KEY_PREFIX.length) : "";
-  }
-
-  function getOrCreateTabIdentity() {
-    try {
-      let tabId = sessionStorage.getItem(TAB_ID_SESSION_KEY);
-      if (tabId) return { tabId, reused: true };
-      tabId = randomId("tab");
-      sessionStorage.setItem(TAB_ID_SESSION_KEY, tabId);
-      return { tabId, reused: false };
-    } catch (_error) {
-      return { tabId: randomId("tab"), reused: false };
-    }
-  }
-
-  function appendError(store, message, kind = "runtime", nowMs = Date.now()) {
-    const storedErrors = store.get(ERRORS_KEY, []);
-    const errors = Array.isArray(storedErrors) ? storedErrors : [];
-    errors.push({ id: randomId("error", nowMs), atMs: nowMs, kind, message: normalizedText(message) });
-    store.set(ERRORS_KEY, errors.slice(-MAX_ERROR_HISTORY));
-  }
-
   function getPlayedRanges(video) {
     const ranges = [];
     try {
@@ -1153,24 +496,6 @@ function makeDescription(channel) {
       } catch (_error) {
         // Continue through fallbacks when YouTube is replacing a subtree.
       }
-    }
-    return "";
-  }
-
-  function channelIdFromDom(root) {
-    const selectors = [
-      'meta[itemprop="channelId"]',
-      'link[itemprop="url"][href*="/channel/UC"]',
-      'ytd-video-owner-renderer a[href*="/channel/UC"]',
-      'ytd-reel-player-header-renderer a[href*="/channel/UC"]',
-      'a[href*="/channel/UC"]',
-    ];
-    for (const selector of selectors) {
-      const element = (root && root.querySelector && root.querySelector(selector)) || document.querySelector(selector);
-      if (!element) continue;
-      const value = element.getAttribute("content") || element.getAttribute("href") || "";
-      const match = value.match(/(?:\/channel\/)?(UC[\w-]+)/);
-      if (match) return match[1];
     }
     return "";
   }
@@ -1265,23 +590,15 @@ function makeDescription(channel) {
           identifiedPlayerData.author ||
           identifiedPlayerData.ownerChannelName ||
           "",
+        title: initialDetails.title || identifiedPlayerData.title || "",
         video_id: expectedVideoId,
       };
     }
 
-    const scope = (video.closest && video.closest("ytd-reel-video-renderer[is-active]")) || document;
-    const fallbackName = textFrom(scope, [
-      "ytd-channel-name #text",
-      "#channel-name #text",
-      "ytd-video-owner-renderer #text",
-      "ytd-reel-player-header-renderer #channel-name",
-      'a[href^="/@"]',
-    ]);
-    const contentChannel = channelFromVideoData(videoData, {
-      id: channelIdFromDom(scope),
-      name: fallbackName,
-    });
-
+    // Only identified content metadata can supply the authoritative channel ID.
+    // Generic page links and stale owner DOM must not relabel another video.
+    const contentChannel = channelFromVideoData(videoData);
+    if (!expectedVideoId) return neutralSnapshot();
     const channel = contentChannel;
     const playbackRate = finiteNumber(video.playbackRate, 1);
     const hasCurrentData = finiteNumber(video.readyState) >= 2;
@@ -1304,6 +621,8 @@ function makeDescription(channel) {
       progressAllowed,
       channel,
       mediaKey,
+      videoId: expectedVideoId,
+      title: normalizedText(videoData.title || initialDetails.title),
       mediaTime: finiteNumber(video.currentTime),
       playbackRate,
       playedRanges: getPlayedRanges(video),
@@ -1356,156 +675,371 @@ function makeDescription(channel) {
     });
   }
 
+
+  // Every mutation reads and writes in one transaction, including prefix allocation.
+  class VideoLedger {
+    constructor({ indexedDB = globalThis.indexedDB, name = "yt-toggl-video-ledger-v2" } = {}) {
+      this.indexedDB = indexedDB;
+      this.name = name;
+      this.db = null;
+      this.openPromise = null;
+    }
+
+    open() {
+      if (this.db) return Promise.resolve(this);
+      if (this.openPromise) return this.openPromise;
+      this.openPromise = new Promise((resolve, reject) => {
+        if (!this.indexedDB || typeof this.indexedDB.open !== "function") {
+          reject(new Error("IndexedDB is unavailable. Allow YouTube site storage to record playback."));
+          return;
+        }
+        const request = this.indexedDB.open(this.name, 1);
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          for (const name of ["records", "batches", "meta"]) {
+            if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: "id" });
+          }
+        };
+        request.onerror = () => reject(new Error(`Cannot open playback storage: ${request.error?.message || "IndexedDB failed"}`));
+        request.onblocked = () => reject(new Error("Playback storage upgrade is blocked. Close other YouTube tabs and reload."));
+        request.onsuccess = () => {
+          this.db = request.result;
+          this.db.onversionchange = () => { this.db.close(); this.db = null; this.openPromise = null; };
+          resolve(this);
+        };
+      }).catch((error) => { this.openPromise = null; throw error; });
+      return this.openPromise;
+    }
+
+    async transaction(mode, operation, readStores = ["records", "batches", "meta"]) {
+      await this.open();
+      return new Promise((resolve, reject) => {
+        const tx = this.db.transaction(["records", "batches", "meta"], mode);
+        const stores = Object.fromEntries(["records", "batches", "meta"].map((name) => [name, tx.objectStore(name)]));
+        const state = { records: [], batches: [], meta: [] };
+        let remaining = readStores.length; let result; let operationError;
+        tx.oncomplete = () => resolve(result);
+        tx.onerror = () => reject(operationError || tx.error || new Error("Playback storage transaction failed."));
+        tx.onabort = () => reject(operationError || tx.error || new Error("Playback storage transaction aborted."));
+        for (const name of readStores) {
+          const request = stores[name].getAll();
+          request.onsuccess = () => {
+            state[name] = request.result;
+            if (--remaining !== 0) return;
+            try { result = operation(state, stores); }
+            catch (error) { operationError = error; tx.abort(); }
+          };
+        }
+      });
+    }
+
+    groups(records) {
+      // Fully consumed history must not extend live inactivity or make current
+      // name-only attribution ambiguous merely because a former channel shared it.
+      records = records.filter((record) => record.durationMs > record.consumedMs);
+      const groups = [];
+      // Stable IDs define groups first; a name-only record joins only an unambiguous ID.
+      for (const record of records.filter((item) => item.channel.id)) {
+        let group = groups.find((item) => item.channel.id === record.channel.id);
+        if (!group) { group = { channel: clone(record.channel), records: [] }; groups.push(group); }
+        group.records.push(record);
+      }
+      for (const record of records.filter((item) => !item.channel.id)) {
+        const matches = groups.filter((item) => channelsEqual(item.channel, record.channel));
+        let group = matches.length === 1 ? matches[0] : groups.find((item) => !item.channel.id && channelsEqual(item.channel, record.channel));
+        if (!group) { group = { channel: clone(record.channel), records: [] }; groups.push(group); }
+        group.records.push(record);
+      }
+      return groups.map((group) => {
+        const pending = group.records.filter((record) => record.durationMs > record.consumedMs);
+        return { ...group, pending,
+          durationMs: pending.reduce((total, record) => total + record.durationMs - record.consumedMs, 0),
+          firstPlayMs: pending.length ? Math.min(...pending.map((record) => record.pendingStartMs)) : null,
+          lastEligibleAtMs: Math.max(...group.records.map((record) => record.lastEligibleAtMs)),
+        };
+      });
+    }
+
+    allocate(group, config, nowMs, stores) {
+      if (group.durationMs <= 0) return null;
+      const belowMinimum = group.durationMs < minimumDurationMs(config) || Math.round(group.durationMs / 1000) < 1;
+      if (belowMinimum && config.mergeBelowMinimum) return null;
+      // Capture works before setup; freeze a destination only once it is usable.
+      if (!belowMinimum && (!Number.isInteger(Number(config.togglWorkspaceId)) || Number(config.togglWorkspaceId) <= 0 ||
+          (config.togglProjectId !== null && (!Number.isInteger(Number(config.togglProjectId)) || Number(config.togglProjectId) <= 0)))) return null;
+      const sources = group.pending.map((record) => ({ recordId: record.id, fromMs: record.consumedMs,
+        toMs: record.durationMs, durationMs: record.durationMs - record.consumedMs, startMs: record.pendingStartMs }));
+      for (const record of group.pending) {
+        record.consumedMs = record.durationMs;
+        record.pendingStartMs = null;
+        stores.records.put(record);
+      }
+      if (belowMinimum) return null;
+      const batch = { id: randomId("batch"), channel: clone(group.channel),
+        description: typeof makeDescription === "function" ? makeDescription(clone(group.channel)) : group.channel.name || group.channel.id || "YouTube",
+        start: new Date(group.firstPlayMs).toISOString(), duration: Math.round(group.durationMs / 1000),
+        durationMs: group.durationMs, workspaceId: Number(config.togglWorkspaceId),
+        projectId: config.togglProjectId === null ? null : Number(config.togglProjectId),
+        sources, createdAtMs: nowMs, status: "pending", nextAttemptAtMs: 0, message: "" };
+      stores.batches.add(batch);
+      return batch;
+    }
+
+    async record(checkpoint, config = CONFIG, timeContext = null) {
+      if (!checkpoint || !normalizedText(checkpoint.id) || !normalizedText(checkpoint.videoId) || !normalizeChannel(checkpoint.channel)) {
+        throw new Error("Playback checkpoint requires a record ID, video ID, and channel.");
+      }
+      for (const key of ["durationMs", "firstPlayMs", "lastEligibleAtMs", "intervalStartMs"]) {
+        if (!Number.isFinite(checkpoint[key]) || checkpoint[key] < 0) throw new Error(`Invalid playback checkpoint ${key}.`);
+      }
+      return this.transaction("readwrite", (state, stores) => {
+        let activityEndMs = checkpoint.lastEligibleAtMs;
+        let activityStartMs = checkpoint.intervalStartMs;
+        let observedNowMs = checkpoint.intervalStartMs;
+        if (timeContext !== null) {
+          const context = timeContext();
+          if (!context || !Number.isFinite(context.nowMs) || context.nowMs < 0 ||
+              !Number.isFinite(context.ageMs) || context.ageMs < 0) {
+            throw new Error("Invalid trusted playback checkpoint clock context.");
+          }
+          this.shiftClock(state, stores, context.nowMs);
+          activityEndMs = context.nowMs - context.ageMs;
+          activityStartMs = activityEndMs - (checkpoint.lastEligibleAtMs - checkpoint.intervalStartMs);
+          observedNowMs = context.nowMs;
+        }
+        let record = state.records.find((item) => item.id === checkpoint.id);
+        if (record && (record.videoId !== checkpoint.videoId || !channelsEqual(record.channel, checkpoint.channel))) {
+          throw new Error("A viewing record cannot change video or channel identity.");
+        }
+        if (record && checkpoint.durationMs <= record.durationMs) return [];
+        const created = [];
+        const matches = this.groups(state.records).filter((group) => channelsEqual(group.channel, checkpoint.channel));
+        const previous = checkpoint.channel.id
+          ? matches.find((group) => group.channel.id === checkpoint.channel.id) || (matches.length === 1 ? matches[0] : null)
+          : matches.length === 1 ? matches[0] : null;
+        if (previous && activityStartMs >= previous.lastEligibleAtMs + inactivityMs(config)) {
+          const batch = this.allocate(previous, config, observedNowMs, stores);
+          if (batch) created.push(batch);
+        }
+        if (!record) {
+          record = { id: checkpoint.id, videoId: checkpoint.videoId, title: normalizedText(checkpoint.title),
+            channel: normalizeChannel(checkpoint.channel), firstPlayMs: checkpoint.firstPlayMs,
+            durationMs: 0, consumedMs: 0, pendingStartMs: checkpoint.firstPlayMs,
+            lastEligibleAtMs: activityEndMs };
+        } else if (record.durationMs === record.consumedMs) {
+          record.pendingStartMs = checkpoint.intervalStartMs;
+        }
+        record.durationMs = checkpoint.durationMs;
+        // A larger cumulative total is the newer checkpoint even after a wall
+        // clock rollback; smaller/equal checkpoints were rejected above.
+        record.lastEligibleAtMs = activityEndMs;
+        // Identity and original first play stay fixed; display metadata may improve.
+        const observedChannel = normalizeChannel(checkpoint.channel);
+        record.channel = { id: record.channel.id || observedChannel.id,
+          name: observedChannel.name || record.channel.name };
+        record.title = normalizedText(checkpoint.title) || record.title;
+        stores.records.put(record);
+        return created;
+      }, ["records", "meta"]);
+    }
+
+    finalize(config = CONFIG, { nowMs = Date.now(), force = false } = {}) {
+      return this.transaction("readwrite", (state, stores) => {
+        const trustedClock = typeof nowMs === "function";
+        const observedNowMs = trustedClock ? nowMs() : nowMs;
+        if (trustedClock) this.shiftClock(state, stores, observedNowMs);
+        const created = [];
+        for (const group of this.groups(state.records)) {
+          if (!force && observedNowMs < group.lastEligibleAtMs + inactivityMs(config)) continue;
+          const batch = this.allocate(group, config, observedNowMs, stores);
+          if (batch) created.push(batch);
+        }
+        return created;
+      }, ["records", "meta"]);
+    }
+
+    observeClock(nowValue = () => Date.now()) {
+      return this.transaction("readwrite", (state, stores) => {
+        // Read the trusted browser wall clock inside the serialized transaction,
+        // never from a delayed playback checkpoint or a pre-lock observation.
+        const wallMs = typeof nowValue === "function" ? nowValue() : nowValue;
+        return this.shiftClock(state, stores, wallMs);
+      }, ["records", "meta"]);
+    }
+
+    shiftClock(state, stores, wallMs) {
+      if (!Number.isFinite(wallMs) || wallMs < 0) throw new Error("Invalid browser wall clock.");
+      let clock = state.meta.find((item) => item.id === "clock");
+      const deltaMs = clock && wallMs < clock.wallMs ? wallMs - clock.wallMs : 0;
+      if (deltaMs < 0) {
+        for (const record of state.records) {
+          if (record.durationMs <= record.consumedMs) continue;
+          record.lastEligibleAtMs += deltaMs;
+          stores.records.put(record);
+        }
+      }
+      if (!clock) { clock = { id: "clock" }; state.meta.push(clock); }
+      clock.wallMs = wallMs;
+      stores.meta.put(clock);
+      return deltaMs;
+    }
+
+    snapshot() {
+      return this.transaction("readonly", (state) => ({ ...state,
+        pendingChannels: this.groups(state.records).filter((group) => group.durationMs > 0).map((group) => ({
+          channel: group.channel, durationMs: group.durationMs, firstPlayMs: group.firstPlayMs,
+          lastEligibleAtMs: group.lastEligibleAtMs,
+        })),
+      }));
+    }
+
+    retry(id) {
+      return this.transaction("readwrite", (state, stores) => {
+        const batch = state.batches.find((item) => item.id === id);
+        if (!batch || !["uncertain", "blocked"].includes(batch.status)) return false;
+        batch.status = "pending"; batch.message = ""; batch.nextAttemptAtMs = 0;
+        stores.batches.put(batch);
+        const worker = state.meta.find((item) => item.id === "worker");
+        if (worker) { worker.authBlocked = false; stores.meta.put(worker); }
+        return true;
+      });
+    }
+
+    dismiss(id) {
+      return this.transaction("readwrite", (state, stores) => {
+        const batch = state.batches.find((item) => item.id === id);
+        if (!batch || !["pending", "uncertain", "blocked"].includes(batch.status)) return false;
+        const wasBlocked = batch.status === "blocked";
+        batch.status = "dismissed"; batch.message = ""; stores.batches.put(batch);
+        const worker = state.meta.find((item) => item.id === "worker");
+        if (wasBlocked && worker) { worker.authBlocked = false; stores.meta.put(worker); }
+        return true;
+      });
+    }
+
+    // Only the holder of the network Web Lock calls recovery, claim, and complete.
+    recoverSending() {
+      return this.transaction("readwrite", (state, stores) => {
+        let count = 0;
+        for (const batch of state.batches) {
+          if (batch.status !== "sending") continue;
+          batch.status = "uncertain";
+          batch.message = "Toggl create was interrupted. Check Toggl before explicitly retrying.";
+          stores.batches.put(batch); count += 1;
+        }
+        return count;
+      });
+    }
+
+    claim(config = CONFIG, nowValue = Date.now()) {
+      return this.transaction("readwrite", (state, stores) => {
+        const nowMs = typeof nowValue === "function" ? nowValue() : nowValue;
+        const worker = state.meta.find((item) => item.id === "worker") || { id: "worker", attempts: [], quotaUntilMs: 0, lastCompletedAtMs: null };
+        if (worker.authBlocked) return { blocked: true };
+        // Future attempts stay counted when the wall clock moves backwards.
+        worker.attempts = worker.attempts.filter((time) => Number.isFinite(time) && time > nowMs - ONE_HOUR_MS).sort((a, b) => a - b);
+        const pending = state.batches.filter((batch) => batch.status === "pending").sort((a, b) => a.createdAtMs - b.createdAtMs || a.id.localeCompare(b.id));
+        if (!pending.length) return {};
+        const limit = Math.max(1, Math.floor(finiteNumber(config.maxRequestsPerHour, 30)));
+        let waitUntilMs = Math.max(worker.quotaUntilMs || 0,
+          worker.lastCompletedAtMs === null ? 0 : worker.lastCompletedAtMs + REQUEST_SPACING_MS);
+        if (worker.attempts.length >= limit) waitUntilMs = Math.max(waitUntilMs, worker.attempts[worker.attempts.length - limit] + ONE_HOUR_MS);
+        const batch = pending.find((item) => (item.nextAttemptAtMs || 0) <= nowMs);
+        if (!batch) waitUntilMs = Math.max(waitUntilMs, Math.min(...pending.map((item) => item.nextAttemptAtMs)));
+        if (waitUntilMs > nowMs || !batch) return { waitUntilMs };
+        batch.status = "sending"; batch.claimedAtMs = nowMs; batch.message = "";
+        worker.attempts.push(nowMs);
+        stores.batches.put(batch); stores.meta.put(worker);
+        return { batch };
+      });
+    }
+
+    complete(id, outcome, nowMs = Date.now()) {
+      return this.transaction("readwrite", (state, stores) => {
+        const batch = state.batches.find((item) => item.id === id);
+        if (!batch || batch.status !== "sending") return null;
+        const result = classifyAttempt(outcome, nowMs);
+        batch.status = result.status; batch.message = result.message; batch.nextAttemptAtMs = result.nextAttemptAtMs;
+        batch.completedAtMs = nowMs;
+        if (result.status === "sent") {
+          try { batch.togglId = JSON.parse(outcome.responseText).id || null; } catch (_error) { batch.togglId = null; }
+        }
+        const worker = state.meta.find((item) => item.id === "worker") || { id: "worker", attempts: [], quotaUntilMs: 0 };
+        worker.lastCompletedAtMs = Math.max(worker.lastCompletedAtMs || 0, nowMs);
+        worker.quotaUntilMs = Math.max(worker.quotaUntilMs || 0, result.quotaUntilMs || 0);
+        if (result.authFailure) worker.authBlocked = true;
+        stores.batches.put(batch); stores.meta.put(worker);
+        return result;
+      });
+    }
+
+    markAttempt(id, nowValue = Date.now()) {
+      return this.transaction("readwrite", (state, stores) => {
+        const batch = state.batches.find((item) => item.id === id);
+        if (!batch || batch.status !== "sending") return false;
+        const nowMs = typeof nowValue === "function" ? nowValue() : nowValue;
+        const worker = state.meta.find((item) => item.id === "worker");
+        if (!worker) throw new Error("Sending batch has no durable request reservation.");
+        const index = worker.attempts.lastIndexOf(batch.claimedAtMs);
+        if (index < 0) throw new Error("Sending batch request reservation is missing.");
+        // Refresh the reservation after the awaited claim and retain future values.
+        worker.attempts[index] = Math.max(worker.attempts[index], nowMs);
+        batch.attemptedAtMs = nowMs;
+        stores.meta.put(worker); stores.batches.put(batch);
+        return true;
+      });
+    }
+  }
+
   class TogglWorker {
-    constructor(store, queue, config = CONFIG) {
-      this.store = store;
-      this.queue = queue;
-      this.config = config;
-      this.workerId = randomId("worker");
-      this.kickPromise = null;
+    constructor(ledger, config = CONFIG, options = {}) {
+      this.ledger = ledger; this.config = config;
+      this.locks = Object.prototype.hasOwnProperty.call(options, "locks") ? options.locks : globalThis.navigator?.locks;
+      this.now = options.now || (() => Date.now());
+      this.sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+      this.send = options.send || postTogglEntry;
+      this.hasSend = Boolean(options.send) || typeof GM_xmlhttpRequest === "function";
+      this.kickPromise = null; this.capabilityError = "";
     }
 
     kick() {
       if (this.kickPromise) return this.kickPromise;
-      const run = Promise.resolve()
-        .then(() => this.drain())
-        .catch((error) => appendError(this.store, error && error.message ? error.message : String(error), "worker"))
-        .finally(() => {
-          if (this.kickPromise === run) this.kickPromise = null;
-        });
-      this.kickPromise = run;
-      return run;
+      this.kickPromise = this.drain().finally(() => { this.kickPromise = null; });
+      return this.kickPromise;
     }
 
     async drain() {
-      const result = await withCrossTabLock(
-        this.store,
-        "worker",
-        async () => {
-          const drainDeadlineMs = Date.now() + 60 * 1000;
-          await this.recoverInterruptedRequests();
-          if (validateConfig(this.config).length > 0) return;
-          const fingerprint = configFingerprint(this.config);
-          const authBlock = this.store.get(AUTH_BLOCK_KEY, null);
-          if (authBlock && authBlock.fingerprint === fingerprint) return;
-          if (authBlock) this.store.delete(AUTH_BLOCK_KEY);
-
-          let claimMisses = 0;
-          while (true) {
-            const nowMs = Date.now();
-            if (nowMs >= drainDeadlineMs) return;
-            const quota = this.store.get(QUOTA_KEY, { untilMs: 0, reason: "" });
-            if (finiteNumber(quota.untilMs) > nowMs) return;
-
-            const queue = this.queue.get();
-            const candidate = queue.find(
-              (entry) => entry.status === "pending" && finiteNumber(entry.nextAttemptAtMs) <= nowMs,
-            );
-            if (!candidate) return;
-
-            const attemptWindow = rollingAttemptWindow(
-              this.store.get(ATTEMPTS_KEY, []),
-              nowMs,
-              this.config.maxRequestsPerHour,
-            );
-            this.store.set(ATTEMPTS_KEY, attemptWindow.attempts);
-            if (!attemptWindow.allowed) {
-              this.store.set(QUOTA_KEY, {
-                untilMs: attemptWindow.retryAtMs,
-                reason: "Local rolling-hour attempt limit",
-              });
-              return;
-            }
-
-            const spacingMs = requestSpacingDelay(this.store.get(LAST_REQUEST_KEY, 0), Date.now());
-            if (spacingMs > 0) await sleep(spacingMs);
-
-            const sendingAtMs = Date.now();
-            let claimed = false;
-            let awaitingLocalCommit = false;
-            await withCrossTabLock(this.store, "tabs", async () => {
-              if (candidate.sourceTabId && candidate.sourceSessionId) {
-                const sourceRecord = normalizeTabRecord(
-                  this.store.get(tabStorageKey(candidate.sourceTabId), null),
-                  candidate.sourceTabId,
-                  sendingAtMs,
-                );
-                awaitingLocalCommit = Boolean(
-                  sourceRecord.active && sourceRecord.active.id === candidate.sourceSessionId,
-                );
-              }
-              if (awaitingLocalCommit) return;
-              await this.queue.mutate((entries) =>
-                entries.map((entry) => {
-                  if (entry.id !== candidate.id || entry.status !== "pending") return entry;
-                  claimed = true;
-                  return {
-                    ...entry,
-                    status: "sending",
-                    sendingSinceMs: sendingAtMs,
-                    attemptCount: entry.attemptCount + 1,
-                    lastError: "",
-                  };
-                }),
-              );
-            });
-            // Queue persistence happens before the source tab is cleared. If a
-            // page dies in that tiny interval, do not POST until recovery has
-            // completed the same deterministic local commit.
-            if (awaitingLocalCommit) return;
-            if (!claimed) {
-              claimMisses += 1;
-              if (claimMisses >= 3) return;
-              continue;
-            }
-            claimMisses = 0;
-
-            const attempts = rollingAttemptWindow(
-              this.store.get(ATTEMPTS_KEY, []),
-              sendingAtMs,
-              this.config.maxRequestsPerHour,
-            ).attempts;
-            attempts.push(sendingAtMs);
-            this.store.set(ATTEMPTS_KEY, attempts);
-            this.store.set(LAST_REQUEST_KEY, sendingAtMs);
-
-            const outcome = await postTogglEntry(candidate, this.config);
-            const classification = classifyAttempt(outcome, Date.now());
-            if (classification.status === "sent") {
-              await this.queue.remove(candidate.id);
-            } else {
-              await this.queue.update(candidate.id, () => ({
-                status: classification.status,
-                nextAttemptAtMs: classification.nextAttemptAtMs,
-                sendingSinceMs: 0,
-                lastError: classification.message,
-              }));
-              appendError(this.store, classification.message, classification.status);
-            }
-
-            if (classification.quotaUntilMs > Date.now()) {
-              this.store.set(QUOTA_KEY, {
-                untilMs: classification.quotaUntilMs,
-                reason: classification.message || "Toggl quota reset",
-              });
-            }
-            if (classification.authFailure) {
-              this.store.set(AUTH_BLOCK_KEY, {
-                fingerprint,
-                atMs: Date.now(),
-                message: classification.message,
-              });
-            }
-            if (classification.stopWorker) return;
+      if (!this.locks || typeof this.locks.request !== "function") {
+        this.capabilityError = "Toggl delivery needs Web Locks. Use a supported browser on https://www.youtube.com; playback remains stored locally.";
+        return;
+      }
+      if (!this.hasSend) {
+        this.capabilityError = "Toggl delivery needs Violentmonkey GM_xmlhttpRequest permission. Reinstall or enable the userscript; playback remains stored locally.";
+        return;
+      }
+      const configErrors = validateConfig(this.config);
+      if (configErrors.length) { this.capabilityError = configErrors.join(" "); return; }
+      this.capabilityError = "";
+      return this.locks.request(`${SCRIPT_ID}:video-ledger-delivery:v2`, async () => {
+        await this.ledger.recoverSending();
+        while (true) {
+          const claim = await this.ledger.claim(this.config, this.now);
+          if (!claim.batch) {
+            const wait = (claim.waitUntilMs || 0) - this.now();
+            // Long quota waits are picked up by the normal periodic worker tick.
+            if (wait > 0 && wait <= REQUEST_SPACING_MS) { await this.sleep(wait); continue; }
+            return;
           }
-        },
-        { ifAvailable: true, leaseMs: 2 * 60 * 1000 },
-      );
-      return result === LOCK_UNAVAILABLE ? false : true;
-    }
-
-    async recoverInterruptedRequests() {
-      await this.queue.mutate(markInterruptedRequestsUncertain);
+          const batch = claim.batch;
+          const destination = { ...this.config, togglWorkspaceId: batch.workspaceId, togglProjectId: batch.projectId };
+          if (!await this.ledger.markAttempt(batch.id, this.now)) return;
+          let outcome;
+          try { outcome = await this.send(clone(batch), destination); }
+          catch (_error) { outcome = { type: "interrupted request" }; }
+          const result = await this.ledger.complete(batch.id, outcome, this.now());
+          if (!result || result.stopWorker) return;
+        }
+      });
     }
   }
 
@@ -1678,1202 +1212,300 @@ function makeDescription(channel) {
     constructor(app) {
       this.app = app;
       this.expanded = false;
-      // YouTube enforces Trusted Types in the page realm, so build both shells
-      // without an HTML-parsing sink such as ShadowRoot.innerHTML.
+      this.channelRows = new Map();
+      this.batchRows = new Map();
       this.buttonHost = document.createElement("div");
       this.buttonHost.id = "yt-toggl-button-host";
       this.buttonHost.dataset.placement = "floating";
       this.buttonShadow = this.buttonHost.attachShadow({ mode: "open" });
-
-      const buttonStyle = document.createElement("style");
-      buttonStyle.textContent = BUTTON_CSS;
-      const summary = document.createElement("button");
-      summary.id = "summary";
-      summary.type = "button";
-      summary.dataset.state = "idle";
-      summary.dataset.attention = "0";
-      summary.setAttribute("aria-expanded", "false");
-      summary.setAttribute("aria-haspopup", "dialog");
-      summary.setAttribute("aria-label", "YouTube watch time");
-      summary.setAttribute("title", "YouTube watch time");
-      const attention = document.createElement("span");
-      attention.id = "attention";
-      summary.append(createStatusIcon(), attention);
-      this.buttonShadow.append(buttonStyle, summary);
-
-      // The panel lives on the body: YouTube translates the masthead to hide it,
-      // and a transformed ancestor would become the containing block for a
-      // fixed-position child and drag the panel out of the viewport.
-      this.host = document.createElement("div");
-      this.host.id = "yt-toggl-status-host";
+      const style = document.createElement("style"); style.textContent = BUTTON_CSS;
+      this.summary = document.createElement("button");
+      this.summary.id = "summary"; this.summary.type = "button";
+      this.summary.setAttribute("aria-expanded", "false");
+      this.summary.setAttribute("aria-haspopup", "dialog");
+      const dot = document.createElement("span"); dot.id = "attention";
+      this.summary.append(createStatusIcon(), dot);
+      this.buttonShadow.append(style, this.summary);
+      this.host = document.createElement("div"); this.host.id = "yt-toggl-status-host";
       this.shadow = this.host.attachShadow({ mode: "open" });
-
-      const panelStyle = document.createElement("style");
-      panelStyle.textContent = PANEL_CSS;
-
-      const panel = document.createElement("section");
-      panel.id = "panel";
-      panel.hidden = true;
-      panel.tabIndex = -1;
-      panel.setAttribute("role", "dialog");
-      panel.setAttribute("aria-label", "YouTube watch time");
-
-      const eyebrow = document.createElement("p");
-      eyebrow.id = "eyebrow";
-      eyebrow.className = "eyebrow";
-      eyebrow.textContent = "NOT TRACKING";
-      const readout = document.createElement("p");
-      readout.id = "readout";
-      readout.textContent = "0:00";
-      const channelLine = document.createElement("p");
-      channelLine.id = "channel";
-      channelLine.textContent = "Nothing playing";
-
-      // The minimum-duration boundary decides whether this session is kept or
-      // carried, so it is the one thing the panel draws rather than states.
-      const thresholdGroup = document.createElement("div");
-      thresholdGroup.id = "threshold-group";
-      thresholdGroup.hidden = true;
-      const threshold = document.createElement("div");
-      threshold.id = "threshold";
-      threshold.dataset.state = "below";
-      const thresholdFill = document.createElement("span");
-      thresholdFill.id = "threshold-fill";
-      threshold.appendChild(thresholdFill);
-      const thresholdCaption = document.createElement("p");
-      thresholdCaption.id = "threshold-caption";
-      thresholdGroup.append(threshold, thresholdCaption);
-
-      const details = document.createElement("dl");
-      details.className = "rows";
-      const appendDetail = (label, id, value) => {
-        const term = document.createElement("dt");
-        term.textContent = label;
-        const description = document.createElement("dd");
-        description.id = id;
-        description.textContent = value;
-        details.append(term, description);
+      const panelStyle = document.createElement("style"); panelStyle.textContent = PANEL_CSS;
+      this.panel = document.createElement("section"); this.panel.id = "panel";
+      this.panel.hidden = true; this.panel.tabIndex = -1;
+      this.panel.setAttribute("role", "dialog"); this.panel.setAttribute("aria-label", "YouTube watch time");
+      const add = (tag, id, text = "") => {
+        const node = document.createElement(tag); node.id = id; node.textContent = text;
+        this.panel.append(node); return node;
       };
-      appendDetail("Carried", "carry", "0:00");
-      appendDetail("Queue", "queue", "0");
-
-      const configBox = document.createElement("div");
-      configBox.id = "config";
-
-      const actions = document.createElement("div");
-      actions.className = "actions";
-      const sync = document.createElement("button");
-      sync.id = "sync";
-      sync.type = "button";
-      sync.textContent = "Sync all tabs";
-      const discardCurrent = document.createElement("button");
-      discardCurrent.id = "discard-current";
-      discardCurrent.className = "danger";
-      discardCurrent.type = "button";
-      discardCurrent.hidden = true;
-      discardCurrent.textContent = "Discard current carry";
-      actions.append(sync, discardCurrent);
-
-      const orphanBox = document.createElement("div");
-      orphanBox.id = "orphans";
-      const decisionBox = document.createElement("div");
-      decisionBox.id = "decisions";
-      const errorBox = document.createElement("div");
-      errorBox.id = "errors";
-      panel.append(
-        eyebrow,
-        readout,
-        channelLine,
-        thresholdGroup,
-        details,
-        configBox,
-        actions,
-        orphanBox,
-        decisionBox,
-        errorBox,
-      );
-      this.shadow.append(panelStyle, panel);
-
-      this.panel = panel;
-      this.summary = summary;
+      add("p", "eyebrow").className = "eyebrow";
+      add("p", "readout"); add("p", "video"); add("p", "channel");
+      add("p", "threshold-caption");
+      const actions = add("div", "actions"); actions.className = "actions";
+      const sync = this.makeAction("Sync", () => this.app.sync()); sync.id = "sync";
+      actions.append(sync);
+      add("p", "error").className = "notice";
+      const clear = this.makeAction("Clear error", () => { this.app.clearError(); this.render(); });
+      clear.id = "clear-error"; this.panel.append(clear);
+      add("h3", "channels-heading", "Unsent by channel"); add("div", "channels");
+      add("h3", "queue-heading", "Delivery"); add("div", "decisions");
+      add("p", "receipt").className = "meta";
+      this.shadow.append(panelStyle, this.panel);
       this.summary.addEventListener("click", () => this.toggle());
-      sync.addEventListener("click", () => this.app.broadcastSync());
-      discardCurrent.addEventListener("click", () => this.app.discardCurrentCarry());
-
-      document.addEventListener(
-        "keydown",
-        (event) => {
-          if (this.expanded && event && event.key === "Escape") this.toggle(false);
-        },
-        true,
-      );
-      document.addEventListener(
-        "click",
-        (event) => {
-          if (!this.expanded || !event) return;
-          const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-          if (path.includes(this.host) || path.includes(this.buttonHost)) return;
-          this.toggle(false);
-        },
-        true,
-      );
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && this.expanded) this.toggle(false);
+      }, true);
+      document.addEventListener("click", (event) => {
+        if (!this.expanded) return;
+        const path = event.composedPath();
+        if (!path.includes(this.host) && !path.includes(this.buttonHost)) this.toggle(false);
+      }, true);
     }
-
     mount() {
-      (document.body || document.documentElement).appendChild(this.host);
-      this.placeButton();
-      this.render();
+      (document.body || document.documentElement).append(this.host);
+      this.placeButton(); this.render();
     }
-
-    findMastheadSlot() {
-      for (const selector of MASTHEAD_SLOTS) {
-        const slot = document.querySelector(selector);
-        if (slot) return slot;
-      }
-      return null;
-    }
-
     placeButton() {
-      // Steady state: already seated in the masthead, so skip the selector scan.
-      // A masthead rebuild detaches the host, which clears isConnected.
       if (this.buttonHost.isConnected && this.buttonHost.dataset.placement === "masthead") return;
-      const slot = this.findMastheadSlot();
-      if (slot) {
-        if (this.buttonHost.parentNode === slot) return;
-        this.buttonHost.dataset.placement = "masthead";
-        slot.prepend(this.buttonHost);
-        return;
+      const slot = MASTHEAD_SLOTS.map((selector) => document.querySelector(selector)).find(Boolean);
+      if (slot) { this.buttonHost.dataset.placement = "masthead"; slot.prepend(this.buttonHost); }
+      else if (!this.buttonHost.isConnected) {
+        this.buttonHost.dataset.placement = "floating";
+        (document.body || document.documentElement).append(this.buttonHost);
       }
-      if (this.buttonHost.isConnected) return;
-      this.buttonHost.dataset.placement = "floating";
-      (document.body || document.documentElement).appendChild(this.buttonHost);
     }
-
-    syncTheme() {
-      const root = document.documentElement;
-      const dark = !root || typeof root.hasAttribute !== "function" || root.hasAttribute("dark");
-      setDataValue(this.buttonHost, "theme", dark ? "dark" : "light");
-    }
-
     positionPanel() {
-      if (this.buttonHost.dataset.placement !== "masthead") {
-        // Both offsets must be explicit: leaving `top` to the stylesheet would
-        // stretch the panel between top and bottom instead of sizing to content.
-        this.panel.style.top = "auto";
-        this.panel.style.bottom = "68px";
-        this.panel.style.right = "16px";
-        return;
-      }
+      const floating = this.buttonHost.dataset.placement !== "masthead";
+      const bar = this.buttonHost.closest("ytd-masthead, #masthead, #masthead-container");
       const rect = this.summary.getBoundingClientRect();
-      // Hang the panel below the whole masthead, not just the button, so it
-      // clears the bar instead of sitting flush against its bottom edge.
-      const bar =
-        typeof this.buttonHost.closest === "function"
-          ? this.buttonHost.closest("ytd-masthead, #masthead, #masthead-container")
-          : null;
-      const barBottom = bar ? bar.getBoundingClientRect().bottom : rect.bottom;
-      const viewportWidth = typeof window === "undefined" ? 0 : nonNegativeNumber(window.innerWidth);
-      this.panel.style.bottom = "auto";
-      this.panel.style.top = `${Math.round(Math.max(rect.bottom, barBottom) + 8)}px`;
-      this.panel.style.right = `${Math.max(12, Math.round(viewportWidth - rect.right))}px`;
+      this.panel.style.top = floating ? "auto" : `${Math.round(Math.max(rect.bottom, bar?.getBoundingClientRect().bottom || 0) + 8)}px`;
+      this.panel.style.bottom = floating ? "68px" : "auto";
+      this.panel.style.right = floating ? "16px" : `${Math.max(12, Math.round(window.innerWidth - rect.right))}px`;
     }
-
     toggle(next = !this.expanded) {
       if (next === this.expanded) return;
-      this.expanded = next;
-      this.panel.hidden = !next;
-      this.summary.setAttribute("aria-expanded", String(next));
-      if (next) this.positionPanel();
-      this.render();
-      if (next) this.panel.focus();
-      else this.summary.focus();
+      this.expanded = next; this.panel.hidden = !next;
+      this.summary.setAttribute("aria-expanded", String(next)); this.render();
+      if (next) { this.positionPanel(); this.panel.focus(); } else this.summary.focus();
     }
-
-    makeAction(label, callback, danger = false, disabled = false) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = label;
-      if (danger) button.className = "danger";
-      button.disabled = disabled;
-      button.addEventListener("click", callback);
-      return button;
+    makeAction(label, callback, danger = false) {
+      const button = document.createElement("button"); button.type = "button";
+      button.textContent = label; if (danger) button.className = "danger";
+      button.addEventListener("click", callback); return button;
     }
-
+    text(id, value) {
+      const node = this.shadow.getElementById(id);
+      if (node.textContent !== value) node.textContent = value;
+    }
+    rows(containerId, map, values, keyOf, create, update) {
+      const container = this.shadow.getElementById(containerId);
+      const keys = new Set();
+      for (const value of values) {
+        const key = keyOf(value); keys.add(key);
+        let row = map.get(key);
+        if (!row) { row = create(value); map.set(key, row); container.append(row.element); }
+        update(row, value);
+      }
+      for (const [key, row] of map) if (!keys.has(key)) { row.element.remove(); map.delete(key); }
+    }
     render() {
-      if (!this.host.isConnected) return;
       this.placeButton();
-      this.syncTheme();
-
-      const record = this.app.getOwnRecord();
-      const currentMs = record.active ? record.active.durationMs : 0;
-      const carryMs = carryDurationMs(record.carry);
-      const queue = this.app.queue.get();
-      const decisions = queue.filter((entry) => entry.status === "uncertain" || entry.status === "blocked");
-      const pendingCount = queue.filter((entry) => entry.status === "pending" || entry.status === "sending").length;
-      const storedErrors = this.app.store.get(ERRORS_KEY, []);
-      const errors = Array.isArray(storedErrors) ? storedErrors : [];
-      const configErrors = validateConfig(this.app.config);
-      const carryTransferProblem = this.app.getCarryTransferIssue();
-      // Expanding refreshes the scan the collapsed button is too hot to run.
-      const orphans = this.expanded ? this.app.refreshStaleCarry() : [];
-      const identityPending = !this.app.identityResolved;
-      // Stale carry from a closed tab is never merged automatically, so the
-      // panel's attach-or-discard choice has to be advertised like any error.
-      const issueCount =
-        decisions.length +
-        configErrors.length +
-        errors.length +
-        this.app.staleCarryCount +
-        (carryTransferProblem ? 1 : 0);
-      const state = !record.active ? "idle" : this.app.playbackIsEligible() ? "tracking" : "paused";
-
-      // The collapsed button reports state, never time.
-      setDataValue(this.summary, "state", state);
-      setDataValue(this.summary, "attention", issueCount ? "1" : "0");
-      setAttributeValue(
-        this.summary,
-        "aria-label",
-        issueCount
-          ? "YouTube watch time, needs attention"
-          : state === "tracking"
-            ? "YouTube watch time, tracking"
-            : state === "paused"
-              ? "YouTube watch time, tracking paused"
-              : "YouTube watch time",
-      );
+      setDataValue(this.buttonHost, "theme", document.documentElement.hasAttribute("dark") ? "dark" : "light");
+      const { app } = this;
+      const view = app.view || { records: [], batches: [], pendingChannels: [] };
+      const record = app.recorder.record;
+      const current = app.currentSnapshot;
+      const tracking = app.playbackIsEligible();
+      const state = tracking ? "tracking" : record ? "paused" : "idle";
+      const errors = [...validateConfig(app.config), app.error, app.worker.capabilityError].filter(Boolean);
+      const decisions = view.batches.filter((batch) => ["uncertain", "blocked"].includes(batch.status));
+      const attention = Boolean(errors.length || decisions.length);
+      setDataValue(this.summary, "state", state); setDataValue(this.summary, "attention", attention ? "1" : "0");
+      const label = attention ? "YouTube watch time, needs attention" : `YouTube watch time, ${state}`;
+      setAttributeValue(this.summary, "aria-label", label); setAttributeValue(this.summary, "title", label);
       if (!this.expanded) return;
-
       this.positionPanel();
-      this.shadow.getElementById("eyebrow").textContent =
-        state === "tracking" ? "NOW TRACKING" : state === "paused" ? "TRACKING PAUSED" : "NOT TRACKING";
-      this.shadow.getElementById("readout").textContent = formatDuration(currentMs);
-      this.shadow.getElementById("channel").textContent = record.active
-        ? record.active.channel.name || record.active.channel.id || "Unnamed channel"
-        : "Nothing playing";
-
-      const minimumMs = minimumDurationMs(this.app.config);
-      // Merge mode finalizes carry together with this session, so the boundary
-      // that decides whether the session is kept applies to the combined total.
-      const towardMinimumMs = this.app.config.mergeBelowMinimum ? carryMs + currentMs : currentMs;
-      const met = towardMinimumMs >= minimumMs;
-      const threshold = this.shadow.getElementById("threshold");
-      this.shadow.getElementById("threshold-group").hidden = !record.active;
-      threshold.dataset.state = met ? "met" : "below";
-      this.shadow.getElementById("threshold-fill").style.width = `${
-        minimumMs > 0 ? Math.round(Math.min(1, towardMinimumMs / minimumMs) * 100) : 100
-      }%`;
-      this.shadow.getElementById("threshold-caption").textContent = met
-        ? "COUNTING"
-        : `${formatDuration(minimumMs - towardMinimumMs)} UNTIL THIS COUNTS`;
-
-      this.shadow.getElementById("carry").textContent = formatDuration(carryMs);
-      this.shadow.getElementById("queue").textContent = pendingCount
-        ? `${queue.length} · ${pendingCount} pending`
-        : String(queue.length);
-
-      const configBox = this.shadow.getElementById("config");
-      configBox.replaceChildren();
-      if (configErrors.length) {
-        const notice = document.createElement("div");
-        notice.className = "notice";
-        const text = document.createElement("p");
-        text.textContent = configErrors.join(" ");
-        notice.appendChild(text);
-        configBox.appendChild(notice);
-      }
-
-      const discardCurrent = this.shadow.getElementById("discard-current");
-      discardCurrent.hidden = carryMs <= 0;
-      discardCurrent.disabled = identityPending;
-      this.shadow.getElementById("sync").disabled = identityPending;
-
-      const orphanBox = this.shadow.getElementById("orphans");
-      orphanBox.replaceChildren();
-      if (carryTransferProblem) {
-        const heading = document.createElement("h3");
-        heading.textContent = "Unreadable carry transfer";
-        const item = document.createElement("div");
-        item.className = "item";
-        const text = document.createElement("p");
-        text.textContent =
-          carryTransferProblem.kind === "unsupported-schema"
-            ? "This transfer was saved by an unsupported script version. Update and reload every YouTube tab before discarding it."
-            : "This saved transfer is malformed and cannot be recovered automatically.";
-        const meta = document.createElement("p");
-        meta.className = "meta";
-        meta.textContent =
-          "Tracking continues. Discarding removes only the journal; carry already written to tab records remains, so ownership may be ambiguous.";
-        const actions = document.createElement("div");
-        actions.className = "actions";
-        actions.append(
-          this.makeAction(
-            "Discard saved transfer",
-            () => this.app.discardUnreadableCarryTransfer(carryTransferProblem.fingerprint),
-            true,
-            identityPending,
-          ),
-        );
-        item.append(text, meta, actions);
-        orphanBox.append(heading, item);
-      }
-      if (orphans.length) {
-        const heading = document.createElement("h3");
-        heading.textContent = "Stale tab carry";
-        orphanBox.appendChild(heading);
-        for (const orphan of orphans) {
-          const item = document.createElement("div");
-          item.className = "item";
-          const text = document.createElement("p");
-          text.textContent = `${formatDuration(carryDurationMs(orphan.carry))} from tab …${orphan.tabId.slice(-8)}`;
-          const actions = document.createElement("div");
-          actions.className = "actions";
-          actions.append(
-            this.makeAction(
-              "Attach to this tab",
-              () => this.app.attachStaleCarry(orphan.tabId),
-              false,
-              identityPending,
-            ),
-            this.makeAction(
-              "Discard",
-              () => this.app.discardStaleCarry(orphan.tabId),
-              true,
-              identityPending,
-            ),
-          );
-          item.append(text, actions);
-          orphanBox.appendChild(item);
-        }
-      }
-
-      const decisionBox = this.shadow.getElementById("decisions");
-      decisionBox.replaceChildren();
-      if (decisions.length) {
-        const heading = document.createElement("h3");
-        heading.textContent = "Needs a decision";
-        decisionBox.appendChild(heading);
-        for (const entry of decisions) {
-          const item = document.createElement("div");
-          item.className = "item";
-          const text = document.createElement("p");
-          text.textContent = `${entry.status === "uncertain" ? "Uncertain" : "Blocked"}: ${entry.description} (${formatDuration(
-            entry.duration * 1000,
-          )})`;
-          const meta = document.createElement("p");
-          meta.className = "meta";
-          meta.textContent = entry.lastError;
-          const actions = document.createElement("div");
-          actions.className = "actions";
-          actions.append(
-            this.makeAction("Retry", () => this.app.retryEntry(entry.id)),
-            this.makeAction("Dismiss", () => this.app.dismissEntry(entry.id), true),
-          );
-          item.append(text, meta, actions);
-          decisionBox.appendChild(item);
-        }
-      }
-
-      const errorBox = this.shadow.getElementById("errors");
-      errorBox.replaceChildren();
-      if (errors.length) {
-        const heading = document.createElement("h3");
-        heading.textContent = "Latest error";
-        const item = document.createElement("div");
-        item.className = "item";
-        const text = document.createElement("p");
-        text.className = "meta";
-        text.textContent = errors[errors.length - 1].message;
-        item.appendChild(text);
-        errorBox.append(heading, item);
-      }
+      const videoId = current?.videoId || current?.mediaKey || record?.videoId;
+      const currentRecords = view.records.filter((item) => item.videoId === videoId);
+      const total = currentRecords.reduce((sum, item) => sum + item.durationMs, 0);
+      this.text("eyebrow", tracking ? "NOW TRACKING" : record ? "TRACKING PAUSED" : "NOT TRACKING");
+      this.text("readout", formatDuration(total));
+      this.text("video", current?.title || record?.title || "Nothing playing");
+      const observedChannel = current?.channel || record?.channel;
+      this.text("channel", observedChannel?.name || observedChannel?.id || "");
+      const pending = view.pendingChannels.find((group) => channelsEqual(group.channel, observedChannel));
+      const left = Math.max(0, minimumDurationMs(app.config) - (pending?.durationMs || 0));
+      this.text("threshold-caption", pending ? (left ? `${formatDuration(left)} UNTIL CHANNEL MINIMUM` : "CHANNEL MINIMUM REACHED") : "");
+      this.text("error", errors.join(" "));
+      this.shadow.getElementById("error").hidden = !errors.length;
+      this.shadow.getElementById("clear-error").hidden = !app.error;
+      this.shadow.getElementById("sync").disabled = !app.ready;
+      this.rows("channels", this.channelRows, view.pendingChannels,
+        (group) => group.channel.id || `name:${group.channel.name.toLowerCase()}`,
+        () => {
+          const element = document.createElement("div"); element.className = "item";
+          const title = document.createElement("p"), detail = document.createElement("p"); detail.className = "meta";
+          element.append(title, detail); return { element, title, detail };
+        }, (row, group) => {
+          const title = `${group.channel.name || group.channel.id} · ${formatDuration(group.durationMs)}`;
+          if (row.title.textContent !== title) row.title.textContent = title;
+          const remaining = Math.max(0, group.lastEligibleAtMs + inactivityMs(app.config) - Date.now());
+          const detail = remaining > 0 ? `Closes after ${formatDuration(remaining)} without playback` : "Waiting for channel minimum or sync";
+          if (row.detail.textContent !== detail) row.detail.textContent = detail;
+        });
+      this.rows("decisions", this.batchRows, view.batches.filter((batch) => ["pending", "sending", "uncertain", "blocked"].includes(batch.status)),
+        (batch) => batch.id, (batch) => {
+          const element = document.createElement("div"); element.className = "item";
+          const title = document.createElement("p"), detail = document.createElement("p"); detail.className = "meta";
+          const actions = document.createElement("div"); actions.className = "actions";
+          const retry = this.makeAction("Retry", () => this.app.retryEntry(batch.id));
+          const dismiss = this.makeAction("Dismiss", () => this.app.dismissEntry(batch.id), true);
+          actions.append(retry, dismiss); element.append(title, detail, actions);
+          return { element, title, detail, actions, retry, dismiss };
+        }, (row, batch) => {
+          const title = `${batch.status}: ${batch.description} · ${formatDuration(batch.duration * 1000)}`;
+          if (row.title.textContent !== title) row.title.textContent = title;
+          const detail = `${batch.start} · Workspace ${batch.workspaceId || ""}${batch.projectId ? ` / Project ${batch.projectId}` : ""}${batch.message ? ` · ${batch.message}` : ""}`;
+          if (row.detail.textContent !== detail) row.detail.textContent = detail;
+          row.retry.hidden = !["uncertain", "blocked"].includes(batch.status);
+          row.dismiss.hidden = batch.status === "sending";
+          row.retry.disabled = row.dismiss.disabled = !app.ready;
+        });
+      const sent = view.batches.filter((batch) => batch.status === "sent");
+      this.text("receipt", sent.length ? `${sent.length} completed ${sent.length === 1 ? "entry" : "entries"} sent` : "");
     }
   }
 
   class BrowserApp {
-    constructor(config = CONFIG) {
-      this.config = config;
-      this.store = new GMStore();
-      this.queue = new SharedQueue(this.store);
-      this.worker = new TogglWorker(this.store, this.queue, config);
-      const tabIdentity = getOrCreateTabIdentity();
-      this.tabId = tabIdentity.tabId;
-      this.reusedTabId = tabIdentity.reused;
-      this.identityResolved = false;
-      this.identityGeneration = 0;
-      // Enumerating tab records is a full storage scan, so the collapsed button
-      // reads the count that recovery and panel expansion leave behind.
-      this.staleCarryCount = 0;
-      this.instanceId = randomId("instance");
-      this.sample = null;
-      this.inactivityDeadline = null;
-      this.discontinuityToken = 0;
-      this.lastPageUrl = location.href;
-      this.operation = Promise.resolve();
+    constructor(config = CONFIG, { ledger = new VideoLedger(), worker = null } = {}) {
+      this.config = config; this.ledger = ledger; this.worker = worker || new TogglWorker(ledger, config);
+      this.recorder = new PlaybackRecorder(config);
+      this.view = { records: [], batches: [], pendingChannels: [], meta: [] };
+      this.currentSnapshot = null; this.ready = false; this.error = "";
+      this.discontinuityToken = 0; this.pending = []; this.operation = Promise.resolve();
+      this.instanceId = randomId("observer");
+      this.channel = null; this.intervals = []; this.stopped = false;
       this.status = new StatusControl(this);
-      this.intervals = [];
-      this.instanceChannel = null;
-      this.probeWaiters = new Map();
-      this.openInstanceChannel();
-      this.openStorageProbeListener();
     }
-
-    openInstanceChannel() {
-      if (this.instanceChannel || typeof BroadcastChannel === "undefined") return;
-      try {
-        this.instanceChannel = new BroadcastChannel("yt-toggl:instances:v1");
-      } catch (_error) {
-        this.instanceChannel = null;
-        return;
-      }
-      this.instanceChannel.addEventListener("message", (event) => {
-        const message = event.data;
-        if (!message || typeof message !== "object") return;
-        if (
-          message.type === "probe" &&
-          message.tabId === this.tabId &&
-          message.requesterId !== this.instanceId
-        ) {
-          this.respondToInstanceProbe(message);
-        }
-        if (message.type === "alive" && message.targetId === this.instanceId) {
-          const resolve = this.probeWaiters.get(message.probeId);
-          if (resolve) resolve(true);
-        }
-      });
-    }
-
-    closeInstanceChannel() {
-      const channel = this.instanceChannel;
-      this.instanceChannel = null;
-      if (!channel) return;
-      try {
-        channel.close();
-      } catch (_error) {
-        // The channel is already unusable.
-      }
-    }
-
-    resetInstanceChannel() {
-      this.closeInstanceChannel();
-      this.openInstanceChannel();
-    }
-
-    captureIdentity() {
-      if (this.identityResolved === false) return null;
-      return { tabId: this.tabId, generation: this.identityGeneration };
-    }
-
-    identityMatches(identity) {
-      return Boolean(
-        identity &&
-          this.identityResolved !== false &&
-          identity.tabId === this.tabId &&
-          identity.generation === this.identityGeneration,
-      );
-    }
-
-    markIdentityResolved(identity) {
-      if (
-        !identity ||
-        identity.tabId !== this.tabId ||
-        identity.generation !== this.identityGeneration ||
-        this.reusedTabId
-      ) {
-        return false;
-      }
-      this.identityResolved = true;
-      return true;
-    }
-
-    respondToInstanceProbe(message) {
-      const response = {
-        type: "alive",
-        probeId: message.probeId,
-        targetId: message.requesterId,
-        responderId: this.instanceId,
-      };
-      if (this.instanceChannel) {
-        try {
-          this.instanceChannel.postMessage(response);
-        } catch (_error) {
-          this.resetInstanceChannel();
-          try {
-            if (this.instanceChannel) this.instanceChannel.postMessage(response);
-          } catch (_retryError) {
-            this.resetInstanceChannel();
-          }
-        }
-      }
-      try {
-        this.store.set(INSTANCE_PROBE_KEY, response);
-      } catch (_storageError) {
-        // The BroadcastChannel response above is sufficient when available.
-      }
-    }
-
-    openStorageProbeListener() {
-      if (typeof GM_addValueChangeListener !== "function") return;
-      GM_addValueChangeListener(INSTANCE_PROBE_KEY, (_name, _oldValue, message) => {
-        if (!message || typeof message !== "object") return;
-        if (
-          message.type === "probe" &&
-          message.tabId === this.tabId &&
-          message.requesterId !== this.instanceId
-        ) {
-          this.respondToInstanceProbe(message);
-        }
-        if (message.type === "alive" && message.targetId === this.instanceId) {
-          const resolve = this.probeWaiters.get(message.probeId);
-          if (resolve) resolve(true);
-        }
-      });
-    }
-
-    async resolveDuplicatedTabId(expectedGeneration = this.identityGeneration) {
-      const resolutionGeneration = nonNegativeNumber(expectedGeneration);
-      if (nonNegativeNumber(this.identityGeneration) !== resolutionGeneration) return null;
-      if (!this.reusedTabId) {
-        return { tabId: this.tabId, generation: this.identityGeneration };
-      }
-      const candidateTabId = this.tabId;
-      let resolvedIdentity = null;
-      await withCrossTabLock(this.store, `identity:${candidateTabId}`, async () => {
-        if (
-          nonNegativeNumber(this.identityGeneration) !== resolutionGeneration ||
-          !this.reusedTabId ||
-          this.tabId !== candidateTabId
-        ) {
-          return;
-        }
-        const answers = await Promise.all([
-          this.probeTab(candidateTabId),
-          this.probeTab(candidateTabId, 750),
-        ]);
-        if (
-          nonNegativeNumber(this.identityGeneration) !== resolutionGeneration ||
-          !this.reusedTabId ||
-          this.tabId !== candidateTabId
-        ) {
-          return;
-        }
-        let answered = false;
-        if (answers.some(Boolean)) answered = true;
-        else if (answers.every((answer) => answer === null)) answered = null;
-        // A definite no-response means this is a reload. If transport itself is
-        // unavailable, isolate the page rather than risk two live tabs sharing ID.
-        if (answered === false) {
-          this.reusedTabId = false;
-          resolvedIdentity = {
-            tabId: this.tabId,
-            generation: this.identityGeneration,
-          };
-          return;
-        }
-
-        this.tabId = randomId("tab");
-        this.identityGeneration = resolutionGeneration + 1;
-        this.reusedTabId = false;
-        this.sample = null;
-        this.inactivityDeadline = null;
-        try {
-          sessionStorage.setItem(TAB_ID_SESSION_KEY, this.tabId);
-        } catch (_error) {
-          // The in-memory ID still keeps this live duplicate independent.
-        }
-        resolvedIdentity = {
-          tabId: this.tabId,
-          generation: this.identityGeneration,
-        };
-      });
-      return resolvedIdentity;
-    }
-
-    probeTab(tabId, timeoutMs = 300) {
-      const targetTabId = normalizedText(tabId);
-      // true: live response; false: sent but unanswered; null: could not send.
-      if (!targetTabId) return Promise.resolve(null);
-      const probeId = randomId("probe");
-      return new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-          this.probeWaiters.delete(probeId);
-          resolve(false);
-        }, timeoutMs);
-        this.probeWaiters.set(probeId, (value) => {
-          clearTimeout(timeout);
-          this.probeWaiters.delete(probeId);
-          resolve(Boolean(value));
-        });
-        const message = {
-          type: "probe",
-          probeId,
-          tabId: targetTabId,
-          requesterId: this.instanceId,
-        };
-        const sendChannelProbe = () => {
-          if (!this.instanceChannel) return false;
-          try {
-            this.instanceChannel.postMessage(message);
-            return true;
-          } catch (_error) {
-            return false;
-          }
-        };
-        let sent = sendChannelProbe();
-        if (this.instanceChannel && !sent) {
-          this.resetInstanceChannel();
-          sent = sendChannelProbe();
-        }
-        if (this.instanceChannel && !sent) {
-          this.resetInstanceChannel();
-        }
-        try {
-          this.store.set(INSTANCE_PROBE_KEY, message);
-          sent = true;
-        } catch (_storageError) {
-          // A working BroadcastChannel remains sufficient.
-        }
-        if (!sent) {
-          if (this.instanceChannel) this.resetInstanceChannel();
-          clearTimeout(timeout);
-          this.probeWaiters.delete(probeId);
-          resolve(null);
-        }
-      });
-    }
-
-    async probeTabs(tabIds) {
-      const probeOnce = async (ids) =>
-        Promise.all(ids.map(async (tabId) => [tabId, await this.probeTab(tabId)]));
-      const candidates = [...new Set(tabIds)];
-      const firstResults = await probeOnce(candidates);
-      const live = new Set(
-        firstResults.filter(([_tabId, alive]) => alive).map(([tabId]) => tabId),
-      );
-      const indeterminate = new Set(
-        firstResults.filter(([_tabId, alive]) => alive === null).map(([tabId]) => tabId),
-      );
-      const missed = candidates.filter(
-        (tabId) => !live.has(tabId) && !indeterminate.has(tabId),
-      );
-      if (missed.length) {
-        const secondResults = await probeOnce(missed);
-        for (const [tabId, alive] of secondResults) {
-          if (alive) live.add(tabId);
-          else if (alive === null) indeterminate.add(tabId);
-        }
-      }
-      return { live, indeterminate };
-    }
-
-    recordNeedsProbe(record, nowMs) {
-      if (
-        record.tabId === this.tabId ||
-        !record.instanceId ||
-        nowMs - record.heartbeatMs < TAB_HEARTBEAT_GRACE_MS
-      ) {
-        return false;
-      }
-      return Boolean(
-        (record.active &&
-          nowMs - record.active.lastEligibleAtMs >= inactivityMs(this.config)) ||
-          (!record.active &&
-            carryDurationMs(record.carry) === 0 &&
-            nowMs - record.heartbeatMs >= inactivityMs(this.config)),
-      );
-    }
-
-    probeSubject(record) {
-      return {
-        instanceId: record.instanceId,
-        heartbeatMs: record.heartbeatMs,
-        activeId: record.active ? record.active.id : "",
-      };
-    }
-
-    probeSubjectMatches(record, subject) {
-      return Boolean(
-        subject &&
-          subject.instanceId === record.instanceId &&
-          subject.heartbeatMs === record.heartbeatMs &&
-          subject.activeId === (record.active ? record.active.id : ""),
-      );
-    }
-
-    getOwnRecord() {
-      return normalizeTabRecord(
-        this.store.get(tabStorageKey(this.tabId), createTabRecord(this.tabId)),
-        this.tabId,
-      );
-    }
-
-    getAllTabRecords() {
-      return this.store
-        .keys()
-        .filter((key) => key.startsWith(TAB_KEY_PREFIX))
-        .map((key) => normalizeTabRecord(this.store.get(key, null), tabIdFromStorageKey(key)))
-        .filter((record) => record.tabId);
-    }
-
-    refreshStaleCarry(nowMs = Date.now()) {
-      const records = this.getStaleCarryRecords(nowMs);
-      this.staleCarryCount = records.length;
-      return records;
-    }
-
-    getStaleCarryRecords(nowMs = Date.now()) {
-      const expirationMs = inactivityMs(this.config);
-      return this.getAllTabRecords().filter(
-        (record) =>
-          record.tabId !== this.tabId &&
-          !record.active &&
-          nowMs - record.heartbeatMs >= expirationMs &&
-          carryDurationMs(record.carry) > 0,
-      );
-    }
-
-    getCarryTransferIssue() {
-      return carryTransferIssue(this.store.get(CARRY_TRANSFER_KEY, null));
-    }
-
-    // An open session survives pauses, buffering, seeks, ended media, and ads
-    // until the inactivity boundary, but none of those states earn credit. The
-    // latest snapshot is the only thing that says whether time is accruing now.
-    playbackIsEligible() {
-      return Boolean(this.sample && this.sample.eligible);
-    }
-
-    withTabsLock(callback) {
-      return withCrossTabLock(this.store, "tabs", () => {
-        completeCarryTransfer(this.store);
-        return callback();
-      });
-    }
-
-    enqueueOperation(callback) {
-      this.operation = this.operation
-        .then(callback)
-        .catch((error) => {
-          this.sample = null;
-          appendError(this.store, error && error.message ? error.message : String(error));
-        })
-        .finally(() => this.status.render());
+    playbackIsEligible() { return this.recorder.isTracking; }
+    clearError() { this.error = ""; }
+    enqueue(callback) {
+      this.operation = this.operation.then(callback).catch((error) => {
+        this.error = error?.message || String(error);
+      }).finally(() => this.status.render());
       return this.operation;
     }
-
-    async addEntriesForIdentity(entries, identity) {
-      if (!this.identityMatches(identity)) return false;
-      if (!entries.length) return true;
-      const existingIds = new Set(this.queue.get().map((entry) => entry.id));
-      await this.queue.add(entries);
-      if (this.identityMatches(identity)) return true;
-      for (const entry of entries) {
-        if (!existingIds.has(entry.id)) await this.queue.remove(entry.id);
-      }
-      return false;
+    publish(message) {
+      try { this.channel?.postMessage({ ...message, from: this.instanceId }); } catch (_error) { /* Polling still refreshes persisted state. */ }
     }
-
-    async commitMachine(machine, entries, nowMs, commandId = "", identity = this.captureIdentity()) {
-      if (!(await this.addEntriesForIdentity(entries, identity))) return false;
-      if (!this.identityMatches(identity)) return false;
-      machine.record.heartbeatMs = nowMs;
-      machine.record.instanceId = this.instanceId;
-      if (commandId) machine.record.lastCommandId = commandId;
-      this.store.set(tabStorageKey(this.tabId), machine.record);
-      this.sample = machine.sample;
-      this.inactivityDeadline = machine.inactivityDeadline;
-      if (entries.length) this.worker.kick();
-      return true;
+    async refresh() {
+      this.view = await this.ledger.snapshot(); this.status.render();
     }
-
-    tick() {
-      return this.enqueueOperation(() => {
-        const identity = this.captureIdentity();
-        if (!identity) return undefined;
-        return this.withTabsLock(async () => {
-          if (!this.identityMatches(identity)) return;
-          const snapshot = discoverMedia(this.discontinuityToken);
-          const machine = new SessionMachine(this.config, this.getOwnRecord());
-          machine.sample = this.sample;
-          machine.inactivityDeadline = this.inactivityDeadline;
-          const entries = machine.tick(snapshot);
-          await this.commitMachine(machine, entries, snapshot.nowMs, "", identity);
-        });
-      });
-    }
-
-    handleSync(commandId) {
-      return this.enqueueOperation(() => {
-        const identity = this.captureIdentity();
-        if (!identity) return undefined;
-        return this.withTabsLock(async () => {
-          if (!this.identityMatches(identity)) return;
-          const record = this.getOwnRecord();
-          if (record.lastCommandId === commandId) return;
-          const snapshot = discoverMedia(this.discontinuityToken);
-          const machine = new SessionMachine(this.config, record);
-          machine.sample = this.sample;
-          machine.inactivityDeadline = this.inactivityDeadline;
-          const entries = machine.sync(snapshot);
-          const committed = await this.commitMachine(
-            machine,
-            entries,
-            snapshot.nowMs,
-            commandId,
-            identity,
-          );
-          if (committed) this.worker.kick();
-        });
-      });
-    }
-
-    broadcastSync() {
-      const identity = this.captureIdentity();
-      if (!identity) return;
-      const command = {
-        id: randomId("sync"),
-        type: "sync",
-        fromTabId: identity.tabId,
-        atMs: Date.now(),
-      };
-      this.store.set(COMMAND_KEY, command);
-      this.handleSync(command.id);
-    }
-
-    async recoverTabs() {
-      const identity = this.captureIdentity();
-      if (!identity) return;
-      const probeAtMs = Date.now();
-      const probeSubjects = new Map(
-        this.getAllTabRecords()
-          .filter((record) => this.recordNeedsProbe(record, probeAtMs))
-          .map((record) => [record.tabId, this.probeSubject(record)]),
-      );
-      const foreignProbe = await this.probeTabs([...probeSubjects.keys()]);
-      if (!this.identityMatches(identity)) return;
-
-      await this.withTabsLock(async () => {
-        if (!this.identityMatches(identity)) return;
-        const nowMs = Date.now();
-        const entries = [];
-        const updates = [];
-        const deletions = [];
-        const records = this.getAllTabRecords();
-        const freshForeignTabs = new Set(
-          records
-            .filter(
-              (record) =>
-                record.tabId !== this.tabId &&
-                nowMs - record.heartbeatMs < TAB_HEARTBEAT_GRACE_MS,
-            )
-            .map((record) => record.tabId),
-        );
-
-        for (const record of records) {
-          const liveOwnSession = Boolean(
-            record.tabId === this.tabId &&
-              record.active &&
-              this.inactivityDeadline &&
-              this.inactivityDeadline.sessionId === record.active.id,
-          );
-          const needsProbe = this.recordNeedsProbe(record, nowMs);
-          const deferUnverifiedRecord =
-            needsProbe && !this.probeSubjectMatches(record, probeSubjects.get(record.tabId));
-          const recordIsLive =
-            liveOwnSession ||
-            freshForeignTabs.has(record.tabId) ||
-            foreignProbe.live.has(record.tabId) ||
-            // Failed transport cannot establish that destructive recovery is safe.
-            foreignProbe.indeterminate.has(record.tabId) ||
-            // The in-lock record is authoritative. Defer anything that became
-            // probe-eligible or changed ownership while probes were in flight.
-            deferUnverifiedRecord;
-          const result = recordIsLive
-            ? { record, entry: null, disposition: "unchanged" }
-            : recoverExpiredRecord(record, nowMs, this.config, makeDescription);
-          if (result.entry) entries.push(result.entry);
-          if (result.disposition !== "unchanged") {
-            // Keep the old heartbeat so recovered carry remains visibly stale.
-            result.record.heartbeatMs = record.heartbeatMs;
-          }
-          const nextRecord = result.disposition === "unchanged" ? record : result.record;
-          if (!recordIsLive && tabRecordIsPrunable(nextRecord, this.tabId, nowMs, this.config)) {
-            deletions.push(nextRecord.tabId);
-          } else if (result.disposition !== "unchanged") {
-            updates.push(nextRecord);
-          }
-        }
-        // Queue first. Deterministic entry IDs make a retry harmless if the
-        // page closes before the corresponding tab-record updates complete.
-        if (!(await this.addEntriesForIdentity(entries, identity))) return;
-        if (!this.identityMatches(identity)) return;
-        for (const record of updates) this.store.set(tabStorageKey(record.tabId), record);
-        for (const tabId of deletions) this.store.delete(tabStorageKey(tabId));
-
-        const own = this.getOwnRecord();
-        own.heartbeatMs = nowMs;
-        own.instanceId = this.instanceId;
-        this.store.set(tabStorageKey(this.tabId), own);
-        this.refreshStaleCarry(nowMs);
-      });
-    }
-
-    attachStaleCarry(sourceTabId) {
-      const identity = this.captureIdentity();
-      if (!identity) return;
-      return this.enqueueOperation(() => {
-        if (!this.identityMatches(identity)) return undefined;
-        return this.withTabsLock(() => {
-          if (!this.identityMatches(identity)) return;
+    async flush() {
+      // Retain ordered, unacknowledged checkpoints in memory. Replacing them
+      // with only the latest total loses interval starts when Sync consumes a
+      // prefix while storage is delayed. IndexedDB still stores one cumulative row.
+      const count = this.pending.length;
+      for (let index = 0; index < count; index += 1) {
+        const { checkpoint, capturedAtMs, monotonicMs } = this.pending[0];
+        await this.ledger.record(checkpoint, this.config, () => {
           const nowMs = Date.now();
-          const source = normalizeTabRecord(
-            this.store.get(tabStorageKey(sourceTabId), createTabRecord(sourceTabId)),
-            sourceTabId,
-            nowMs,
-          );
-          if (nowMs - source.heartbeatMs < inactivityMs(this.config)) {
-            throw new Error("That tab is active again; its carry was not attached.");
-          }
-          if (source.active) {
-            throw new Error("That tab's expired session is still being recovered; try again shortly.");
-          }
-          const transfer = createCarryTransfer(source, identity.tabId, this.instanceId, nowMs);
-          if (transfer) {
-            const result = beginCarryTransfer(this.store, transfer);
-            if (result && tabRecordIsPrunable(result.source, identity.tabId, nowMs, this.config)) {
-              this.store.delete(tabStorageKey(result.source.tabId));
-            }
-          }
-          this.refreshStaleCarry(nowMs);
+          const monotonicNow = typeof performance?.now === "function" ? performance.now() : nowMs;
+          return { nowMs, ageMs: Math.max(0, nowMs - capturedAtMs, monotonicNow - monotonicMs) };
         });
-      });
-    }
-
-    discardStaleCarry(sourceTabId) {
-      const identity = this.captureIdentity();
-      if (!identity) return;
-      if (!window.confirm("Permanently discard this stale tab's carried watch time?")) return;
-      return this.enqueueOperation(() => {
-        if (!this.identityMatches(identity)) return undefined;
-        return this.withTabsLock(() => {
-          if (!this.identityMatches(identity)) return;
-          const nowMs = Date.now();
-          const source = normalizeTabRecord(
-            this.store.get(tabStorageKey(sourceTabId), createTabRecord(sourceTabId)),
-            sourceTabId,
-            nowMs,
-          );
-          if (nowMs - source.heartbeatMs < inactivityMs(this.config)) {
-            throw new Error("That tab is active again; its carry was not discarded.");
-          }
-          if (source.active) {
-            throw new Error("That tab's expired session is still being recovered; try again shortly.");
-          }
-          this.store.delete(tabStorageKey(sourceTabId));
-          this.refreshStaleCarry(nowMs);
-        });
-      });
-    }
-
-    discardCurrentCarry() {
-      const identity = this.captureIdentity();
-      if (!identity) return;
-      if (!window.confirm("Permanently discard this tab's carried watch time?")) return;
-      return this.enqueueOperation(() => {
-        if (!this.identityMatches(identity)) return undefined;
-        return this.withTabsLock(() => {
-          if (!this.identityMatches(identity)) return;
-          const next = discardCarry(this.getOwnRecord());
-          next.heartbeatMs = Date.now();
-          next.instanceId = this.instanceId;
-          this.store.set(tabStorageKey(identity.tabId), next);
-        });
-      });
-    }
-
-    discardUnreadableCarryTransfer(fingerprint) {
-      const identity = this.captureIdentity();
-      if (!identity) return;
-      if (
-        !window.confirm(
-          "Discard only the unreadable carry-transfer journal? Existing tab carry will be preserved, but ownership may remain ambiguous.",
-        )
-      ) {
-        return;
+        this.pending.shift();
       }
-      return this.enqueueOperation(() => {
-        if (!this.identityMatches(identity)) return undefined;
-        return this.withTabsLock(() => {
-          if (!this.identityMatches(identity)) return;
-          return discardCarryTransferJournal(this.store, fingerprint);
-        });
+    }
+    tick({ finalize = true } = {}) {
+      if (!this.ready || this.stopped) return this.operation;
+      // Capture at event time, before awaiting storage, to preserve pause/rate tails.
+      const snapshot = discoverMedia(this.discontinuityToken);
+      const result = this.recorder.observe(snapshot);
+      this.currentSnapshot = snapshot;
+      if (result.checkpoint) this.pending.push({ checkpoint: result.checkpoint,
+        capturedAtMs: snapshot.nowMs, monotonicMs: snapshot.monotonicMs });
+      this.status.render();
+      return this.enqueue(async () => {
+        await this.flush();
+        if (finalize) await this.ledger.finalize(this.config, { nowMs: () => Date.now() });
+        await this.refresh();
+        if (result.checkpoint) this.publish({ type: "changed" });
+        this.kickWorker();
       });
     }
-
-    retryEntry(entryId) {
-      return this.enqueueOperation(async () => {
-        await this.queue.update(entryId, (entry) => ({
-          status: "pending",
-          nextAttemptAtMs: 0,
-          sendingSinceMs: 0,
-          lastError: "",
-        }));
-        this.store.delete(AUTH_BLOCK_KEY);
-        this.worker.kick();
+    kickWorker() {
+      // Networking never blocks playback checkpoints behind a 30-second request.
+      if (this.worker.kickPromise) return;
+      this.worker.kick().then(() => this.enqueue(() => this.refresh())).catch((error) => {
+        this.error = error?.message || String(error); this.status.render();
       });
     }
-
-    dismissEntry(entryId) {
-      if (!window.confirm("Dismiss this unsent entry? This cannot be undone by the userscript.")) return;
-      return this.enqueueOperation(() => this.queue.remove(entryId));
+    async sync() {
+      if (!this.ready) return;
+      this.publish({ type: "sync" });
+      await this.tick({ finalize: false });
+      // Give live pages a bounded opportunity to flush; a suspended page cannot
+      // hold a global Sync open. Its later contributions start another batch.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return this.enqueue(async () => {
+        await this.flush();
+        await this.ledger.finalize(this.config, { nowMs: () => Date.now(), force: true });
+        await this.refresh(); this.publish({ type: "changed" }); this.kickWorker();
+      });
     }
-
+    retryEntry(id) {
+      return this.enqueue(async () => {
+        await this.ledger.retry(id); await this.refresh(); this.publish({ type: "changed" }); this.kickWorker();
+      });
+    }
+    dismissEntry(id) {
+      if (!window.confirm("Dismiss this entry without sending it?")) return;
+      return this.enqueue(async () => {
+        await this.ledger.dismiss(id); await this.refresh(); this.publish({ type: "changed" });
+      });
+    }
+    openChannel() {
+      if (this.channel || typeof BroadcastChannel === "undefined") return;
+      try { this.channel = new BroadcastChannel("yt-toggl-video-ledger-v2"); }
+      catch (_error) { return; }
+      this.channel.addEventListener("message", (event) => {
+        const message = event.data;
+        if (!message || message.from === this.instanceId) return;
+        if (message.type === "changed") this.enqueue(() => this.refresh());
+        if (message.type === "sync") this.tick({ finalize: false }).then(() => this.publish({ type: "changed" }));
+      });
+    }
     bindEvents() {
-      const mediaEvents = [
-        "play",
-        "playing",
-        "canplay",
-        "pause",
-        "waiting",
-        "stalled",
-        "seeking",
-        "seeked",
-        "ratechange",
-        "ended",
-        "loadedmetadata",
-      ];
-      for (const eventName of mediaEvents) {
-        document.addEventListener(
-          eventName,
-          (event) => {
-            if (!event.target || event.target.tagName !== "VIDEO") return;
-            if (eventName === "seeking") this.discontinuityToken += 1;
-            this.tick();
-          },
-          true,
-        );
+      for (const eventName of ["play", "playing", "canplay", "pause", "waiting", "stalled", "seeking", "seeked", "ratechange", "ended", "loadedmetadata"]) {
+        document.addEventListener(eventName, (event) => {
+          const selected = selectActiveVideo(document.querySelectorAll("video"));
+          if (!event.target || event.target !== selected) return;
+          if (eventName === "seeking") this.discontinuityToken += 1;
+          this.tick();
+        }, true);
       }
-
-      const navigationHandler = () => {
-        if (location.href !== this.lastPageUrl) {
-          this.lastPageUrl = location.href;
-          this.discontinuityToken += 1;
-        }
-        this.tick();
-        setTimeout(() => this.tick(), 250);
-        setTimeout(() => this.tick(), 1000);
-      };
-      document.addEventListener("yt-navigate-finish", navigationHandler, true);
-      document.addEventListener("yt-page-data-updated", navigationHandler, true);
-
-      GM_addValueChangeListener(COMMAND_KEY, (_name, _oldValue, command, remote) => {
-        if (remote && command && command.type === "sync" && command.id) this.handleSync(command.id);
-      });
-      GM_addValueChangeListener(QUEUE_KEY, () => {
-        this.status.render();
-        this.worker.kick();
-      });
-
+      for (const eventName of ["yt-navigate-finish", "yt-page-data-updated"]) document.addEventListener(eventName, () => this.tick(), true);
       window.addEventListener("pagehide", () => {
-        this.closeInstanceChannel();
+        this.tick({ finalize: false }); this.stopped = true;
+        this.recorder.reset(); this.channel?.close(); this.channel = null;
       });
       window.addEventListener("pageshow", (event) => {
         if (!event.persisted) return;
-        this.openInstanceChannel();
-        this.reusedTabId = true;
-        this.identityGeneration = nonNegativeNumber(this.identityGeneration) + 1;
-        const restoreGeneration = this.identityGeneration;
-        this.identityResolved = false;
-        this.status.render();
-        this.enqueueOperation(async () => {
-          const identity = await this.resolveDuplicatedTabId(restoreGeneration);
-          this.markIdentityResolved(identity);
-        });
-        this.tick();
+        this.stopped = false; this.recorder.reset(); this.openChannel(); this.tick();
       });
     }
-
     async start() {
       this.status.mount();
-      const identity = await this.resolveDuplicatedTabId(this.identityGeneration);
-      if (!this.markIdentityResolved(identity)) return;
-      this.status.render();
-      await this.recoverTabs();
-      this.bindEvents();
-      await this.tick();
-      this.worker.kick();
-      this.intervals.push(setInterval(() => this.tick(), TICK_INTERVAL_MS));
-      this.intervals.push(
-        setInterval(
-          () =>
-            this.enqueueOperation(async () => {
-              await this.recoverTabs();
-              this.worker.kick();
-            }),
-          WORKER_INTERVAL_MS,
-        ),
-      );
+      try {
+        await this.ledger.open(); this.ready = true;
+        this.openChannel(); this.bindEvents(); await this.tick();
+        this.intervals.push(setInterval(() => this.tick(), TICK_INTERVAL_MS));
+        this.intervals.push(setInterval(() => this.kickWorker(), WORKER_INTERVAL_MS));
+      } catch (error) { this.error = error?.message || String(error); this.status.render(); }
     }
   }
 
-  const API = {
-    CONFIG,
-    BrowserApp,
-    SessionMachine,
-    TogglWorker,
-    attachCarry,
-    beginCarryTransfer,
-    buildTogglRequest,
-    carryDurationMs,
-    carryTransferIssue,
-    channelFromVideoData,
-    channelsEqual,
-    classifyAttempt,
-    completeCarryTransfer,
-    configFingerprint,
-    createCarryTransfer,
-    createTabRecord,
-    discardCarry,
-    discardCarryTransferJournal,
-    discoverMedia,
-    encodeBasicAuth,
-    enqueueUnique,
-    finalizeTabRecord,
-    formatDuration,
-    inactivityMs,
-    makeDescription,
-    markInterruptedRequestsUncertain,
-    minimumDurationMs,
-    normalizeCarry,
-    normalizeCarryTransfer,
-    normalizeQueue,
-    normalizeSnapshot,
-    normalizeTabRecord,
-    parseResponseHeaders,
-    playedRangeCovers,
-    recoverExpiredRecord,
-    requestSpacingDelay,
-    rollingAttemptWindow,
-    selectActiveVideo,
-    tabRecordIsPrunable,
-    validatedPlaybackMs,
-    validateConfig,
-  };
-
+  const API = {CONFIG,BrowserApp,StatusControl,PlaybackRecorder,VideoLedger,TogglWorker,clone,normalizeChannel,channelsEqual,mergeChannel,normalizeSnapshot,validatedPlaybackMs,selectActiveVideo,closestTrackablePlayer,isTopLevelBrowsingContext,discoverMedia,validateConfig,buildTogglRequest,encodeBasicAuth,parseResponseHeaders,classifyAttempt,rollingAttemptWindow,requestSpacingDelay,randomId,minimumDurationMs,inactivityMs};
   if (typeof module !== "undefined" && module.exports) module.exports = API;
-
-  if (
-    typeof window !== "undefined" &&
-    typeof document !== "undefined" &&
-    typeof GM_getValue === "function" &&
-    isTopLevelBrowsingContext()
-  ) {
-    const app = new BrowserApp(CONFIG);
-    app.start().catch((error) => {
-      try {
-        appendError(app.store, error && error.message ? error.message : String(error), "startup");
-      } catch (_storageError) {
-        console.error("yt-toggl failed to start", error);
-      }
-    });
+  if (typeof module === "undefined" && typeof window !== "undefined" && typeof document !== "undefined" && isTopLevelBrowsingContext()) {
+    new BrowserApp(CONFIG).start();
   }
 })();
