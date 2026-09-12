@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         Youtube Toggl Sync
-// @namespace    https://github.com/local/yt-toggl
+// @namespace    https://github.com/jtkehler/yt-toggl
 // @version      2.1.0
 // @description  Track eligible YouTube playback locally and create completed Toggl entries.
-// @author       You
+// @author       jtkehler
+// @homepageURL  https://github.com/jtkehler/yt-toggl
+// @supportURL   https://github.com/jtkehler/yt-toggl/issues
+// @downloadURL  https://raw.githubusercontent.com/jtkehler/yt-toggl/main/yt-toggl.user.js
+// @updateURL    https://raw.githubusercontent.com/jtkehler/yt-toggl/main/yt-toggl.user.js
 // @match        https://www.youtube.com/*
 // @noframes
 // @grant        GM_xmlhttpRequest
@@ -19,14 +23,14 @@
  */
 
 const CONFIG = {
-  togglApiToken: "",
-  togglWorkspaceId: 0,
-  togglProjectId: null,
-  inactivityMinutes: 10,
-  minimumDurationMinutes: 1,
-  mergeBelowMinimum: true,
-  dayBoundary: null, // Off; set a local 24-hour time such as "04:00".
-  maxRequestsPerHour: 30,
+  togglApiToken: "",         // Your Toggl Track API token; never stored in IndexedDB.
+  togglWorkspaceId: 0,       // Required positive integer workspace ID for new entries.
+  togglProjectId: null,      // Positive integer project ID in that workspace; null omits the project.
+  inactivityMinutes: 10,     // Minutes without validated playback across tabs before a channel closes; must be > 0.
+  minimumDurationMinutes: 1, // Minimum combined playback minutes per channel; 0 disables the minimum.
+  mergeBelowMinimum: true,   // true keeps short time for the same channel; false discards it on closure.
+  dayBoundary: null,         // Local "HH:MM" cutoff (e.g. "04:00"); earlier batch starts use previous day's 23:59; null disables.
+  maxRequestsPerHour: 30,    // Positive integer cap on delivery attempts per rolling hour, shared across tabs.
 };
 
 // Customize Toggl descriptions here. The channel object has `id` and `name`.

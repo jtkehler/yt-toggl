@@ -4,22 +4,24 @@ A dependency-free Violentmonkey userscript that records YouTube watch time local
 
 Records are shared across YouTube tabs and windows in the same browser profile. Ordinary desktop videos, live streams, and Shorts use the same elapsed-playback measurement.
 
+[Repository](https://github.com/jtkehler/yt-toggl) · [Report an issue](https://github.com/jtkehler/yt-toggl/issues).
+
 ## Install and configure
 
 1. Install [Violentmonkey](https://violentmonkey.github.io/).
-2. Open [yt-toggl.user.js](./yt-toggl.user.js) as a raw userscript and install it.
-3. Edit `CONFIG` in Violentmonkey, set your Toggl API token and workspace ID, save, and reload your YouTube tabs.
+2. Open [yt-toggl.user.js](https://raw.githubusercontent.com/jtkehler/yt-toggl/main/yt-toggl.user.js) and install it.
+3. Edit `CONFIG` in Violentmonkey, using its inline comments as a guide. Set your Toggl API token and workspace ID, save, and reload your YouTube tabs.
 
 | Setting | Meaning |
 | --- | --- |
 | `togglApiToken` | Your Toggl Track API token; authentication uses `<token>:api_token`. |
-| `togglWorkspaceId` | Positive numeric workspace ID. |
-| `togglProjectId` | Optional positive numeric project ID; `null` omits it. |
-| `inactivityMinutes` | Close a channel after this much time without validated playback. Default: 10. |
-| `minimumDurationMinutes` | Minimum combined channel duration. Default: 1; use 0 to disable. |
+| `togglWorkspaceId` | Required positive integer workspace ID. |
+| `togglProjectId` | Optional positive integer project ID; `null` omits it. |
+| `inactivityMinutes` | Close a channel after this many minutes without validated playback. Must be greater than 0; default: 10. |
+| `minimumDurationMinutes` | Minimum combined channel duration in minutes. Default: 1; use 0 to disable. |
 | `mergeBelowMinimum` | `true` retains short time for the same channel; `false` discards a closed channel total below the minimum. Must be a boolean. |
 | `dayBoundary` | Optional local start of day in 24-hour `"HH:MM"` format, e.g. `"04:00"`. Default: `null` (off). |
-| `maxRequestsPerHour` | Local rolling-hour attempt cap. Default: 30. |
+| `maxRequestsPerHour` | Positive integer cap on request attempts per rolling hour, shared across YouTube tabs. Default: 30. |
 
 Playback can be recorded before credentials are complete. Time stays unbatched until a valid workspace/project destination is configured. An outgoing batch freezes its destination; changing configuration does not retarget existing batches.
 
