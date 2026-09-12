@@ -27,6 +27,8 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     sync() { calls.push(["sync"]); },
     retryEntry(id) { calls.push(["retry", id]); },
     dismissEntry(id) { calls.push(["dismiss", id]); },
+    discardChannel(value) { calls.push(["discard-channel", value.id]); },
+    discardAll() { calls.push(["discard-all"]); },
     clearError() { this.error = ""; calls.push(["clear"]); },
   };
   const status = new API.StatusControl(app);
@@ -45,8 +47,8 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     assert(decisions.textContent.includes("2026"), "queued decision includes a viewing timestamp");
     const findAction = label => Array.from(decisions.querySelectorAll("button")).find(button => button.textContent === label);
     const retry = findAction("Retry");
-    const dismiss = findAction("Dismiss");
-    assert(retry && dismiss, "uncertain entry exposes explicit Retry and Dismiss actions");
+    const dismiss = findAction("Discard");
+    assert(retry && dismiss, "uncertain entry exposes explicit Retry and Discard actions");
     retry.focus();
     assert(shadow.activeElement === retry, "Retry receives actual native focus");
     app.view = { ...app.view, batches: app.view.batches.map(entry => ({ ...entry })) };
@@ -60,6 +62,30 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     shadow.getElementById("sync").click();
     assert(calls.at(-1)[0] === "sync", "Sync invokes global app sync");
     results.push("native shadow DOM, current video, channel total, keyed focus, scoped actions");
+
+    const channels = shadow.getElementById("channels");
+    const channelDiscard = Array.from(channels.querySelectorAll("button")).find(button => button.textContent === "Discard");
+    const discardAll = Array.from(shadow.querySelectorAll("button")).find(button => button.textContent === "Discard all unsent");
+    assert(channelDiscard && discardAll && !discardAll.disabled, "pending channel and global unsent totals expose discard actions");
+    channelDiscard.focus();
+    app.view = { ...app.view, pendingChannels: app.view.pendingChannels.map(group => ({ ...group,
+      channel: { ...group.channel, name: "Updated native channel name" }, durationMs: 66000 })) };
+    status.render();
+    assert(channels.querySelector("button") === channelDiscard && shadow.activeElement === channelDiscard,
+      "channel refresh preserves discard node and focus while metadata and credit change");
+    channelDiscard.click();
+    discardAll.click();
+    assert(JSON.stringify(calls.slice(-2)) === JSON.stringify([["discard-channel", channel.id], ["discard-all"]]),
+      "individual channel and global discard actions use their intended scopes");
+    const pendingChannels = app.view.pendingChannels;
+    app.view = { ...app.view, pendingChannels: [], batches: [{ ...batch, status: "sending" }] };
+    status.render();
+    assert(findAction("Discard").hidden && findAction("Retry").hidden,
+      "a sending batch offers no discard or retry control");
+    assert(discardAll.disabled, "sending-only state disables bulk discard");
+    app.view = { ...app.view, pendingChannels, batches: [batch] };
+    status.render();
+    results.push("channel and bulk discard scopes, stable channel focus, sending protection");
 
     app.recorder.creditedMs = 0;
     status.render();
@@ -83,6 +109,11 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     app.ready = false;
     status.render();
     assert(shadow.getElementById("sync").disabled, "Sync waits for ledger readiness");
+    assert(discardAll.disabled && channels.querySelector("button").disabled,
+      "channel and bulk discard wait for ledger readiness");
+    app.view.batches = [{ ...batch, status: "pending" }];
+    status.render();
+    assert(findAction("Discard").disabled, "queued entry discard waits for ledger readiness");
     results.push("validated stalled state, resolved attention, clearable errors, capability and readiness states");
     status.toggle(false);
     assert(shadow.getElementById("panel").hidden && summary.getAttribute("aria-expanded") === "false",

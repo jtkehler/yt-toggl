@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         YouTube Watch Time → Toggl
+// @name         Youtube Toggl Sync
 // @namespace    https://github.com/local/yt-toggl
-// @version      2.0.0
+// @version      2.1.0
 // @description  Track eligible YouTube playback locally and create completed Toggl entries.
 // @author       You
 // @match        https://www.youtube.com/*
@@ -37,6 +37,7 @@ function makeDescription(channel) {
   "use strict";
 
   const SCRIPT_ID = "yt-toggl";
+  const SCRIPT_NAME = "Youtube Toggl Sync";
   const ONE_HOUR_MS = 3600000;
   const REQUEST_SPACING_MS = 1000;
   const DEFAULT_RATE_BACKOFF_MS = 120000;
@@ -917,6 +918,44 @@ function makeDescription(channel) {
       });
     }
 
+    discardChannel(channel) {
+      const target = normalizeChannel(channel);
+      if (!target) return Promise.resolve(false);
+      return this.transaction("readwrite", (state, stores) => {
+        // Match the displayed group exactly; a stale name-only action must not
+        // follow a name fallback into a newly identified, different channel.
+        const group = this.groups(state.records).find((item) => target.id
+          ? item.channel.id === target.id
+          : !item.channel.id && item.channel.name.toLowerCase() === target.name.toLowerCase());
+        if (!group) return false;
+        for (const record of group.pending) {
+          record.consumedMs = record.durationMs; record.pendingStartMs = null;
+          stores.records.put(record);
+        }
+        return true;
+      }, ["records"]);
+    }
+
+    discardAll() {
+      return this.transaction("readwrite", (state, stores) => {
+        // Freeze the discard boundary with allocation and sending claims. Keep
+        // cumulative history so repeated observer checkpoints remain idempotent.
+        for (const record of state.records) {
+          if (record.durationMs <= record.consumedMs) continue;
+          record.consumedMs = record.durationMs; record.pendingStartMs = null;
+          stores.records.put(record);
+        }
+        let wasBlocked = false;
+        for (const batch of state.batches) {
+          if (!["pending", "uncertain", "blocked"].includes(batch.status)) continue;
+          wasBlocked ||= batch.status === "blocked";
+          batch.status = "dismissed"; batch.message = ""; stores.batches.put(batch);
+        }
+        const worker = state.meta.find((item) => item.id === "worker");
+        if (wasBlocked && worker) { worker.authBlocked = false; stores.meta.put(worker); }
+      });
+    }
+
     // Only the holder of the network Web Lock calls recovery, claim, and complete.
     recoverSending() {
       return this.transaction("readwrite", (state, stores) => {
@@ -1136,6 +1175,7 @@ function makeDescription(channel) {
     @keyframes rise { from { opacity: 0; transform: translateY(-4px); } }
     .eyebrow { margin: 0; font: 10px/1 var(--mono); letter-spacing: 0.12em;
       text-transform: uppercase; color: var(--muted); }
+    #script-name { margin: 0 0 16px; font-size: 14px; font-weight: 600; }
     #readout { margin: 9px 0 3px; font: 30px/1 var(--mono); letter-spacing: -0.01em;
       font-variant-numeric: tabular-nums; }
     #channel { margin: 0; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
@@ -1231,17 +1271,20 @@ function makeDescription(channel) {
       const panelStyle = document.createElement("style"); panelStyle.textContent = PANEL_CSS;
       this.panel = document.createElement("section"); this.panel.id = "panel";
       this.panel.hidden = true; this.panel.tabIndex = -1;
-      this.panel.setAttribute("role", "dialog"); this.panel.setAttribute("aria-label", "YouTube watch time");
+      this.panel.setAttribute("role", "dialog"); this.panel.setAttribute("aria-label", SCRIPT_NAME);
       const add = (tag, id, text = "") => {
         const node = document.createElement(tag); node.id = id; node.textContent = text;
         this.panel.append(node); return node;
       };
+      add("h2", "script-name", SCRIPT_NAME);
       add("p", "eyebrow").className = "eyebrow";
       add("p", "readout"); add("p", "video"); add("p", "channel");
       add("p", "threshold-caption");
       const actions = add("div", "actions"); actions.className = "actions";
       const sync = this.makeAction("Sync", () => this.app.sync()); sync.id = "sync";
-      actions.append(sync);
+      const discardAll = this.makeAction("Discard all unsent", () => this.app.discardAll(), true);
+      discardAll.id = "discard-all";
+      actions.append(sync, discardAll);
       add("p", "error").className = "notice";
       const clear = this.makeAction("Clear error", () => { this.app.clearError(); this.render(); });
       clear.id = "clear-error"; this.panel.append(clear);
@@ -1319,7 +1362,7 @@ function makeDescription(channel) {
       const decisions = view.batches.filter((batch) => ["uncertain", "blocked"].includes(batch.status));
       const attention = Boolean(errors.length || decisions.length);
       setDataValue(this.summary, "state", state); setDataValue(this.summary, "attention", attention ? "1" : "0");
-      const label = attention ? "YouTube watch time, needs attention" : `YouTube watch time, ${state}`;
+      const label = `${SCRIPT_NAME}, ${attention ? "needs attention" : state}`;
       setAttributeValue(this.summary, "aria-label", label); setAttributeValue(this.summary, "title", label);
       if (!this.expanded) return;
       this.positionPanel();
@@ -1338,13 +1381,20 @@ function makeDescription(channel) {
       this.shadow.getElementById("error").hidden = !errors.length;
       this.shadow.getElementById("clear-error").hidden = !app.error;
       this.shadow.getElementById("sync").disabled = !app.ready;
+      this.shadow.getElementById("discard-all").disabled = !app.ready ||
+        !(view.pendingChannels.length || view.batches.some((batch) => ["pending", "uncertain", "blocked"].includes(batch.status)));
       this.rows("channels", this.channelRows, view.pendingChannels,
         (group) => group.channel.id || `name:${group.channel.name.toLowerCase()}`,
         () => {
           const element = document.createElement("div"); element.className = "item";
           const title = document.createElement("p"), detail = document.createElement("p"); detail.className = "meta";
-          element.append(title, detail); return { element, title, detail };
+          const actions = document.createElement("div"); actions.className = "actions";
+          const row = { element, title, detail, channel: null };
+          row.discard = this.makeAction("Discard", () => this.app.discardChannel(row.channel), true);
+          actions.append(row.discard); element.append(title, detail, actions); return row;
         }, (row, group) => {
+          row.channel = group.channel;
+          row.discard.disabled = !app.ready;
           const title = `${group.channel.name || group.channel.id} · ${formatDuration(group.durationMs)}`;
           if (row.title.textContent !== title) row.title.textContent = title;
           const remaining = Math.max(0, group.lastEligibleAtMs + inactivityMs(app.config) - Date.now());
@@ -1357,7 +1407,7 @@ function makeDescription(channel) {
           const title = document.createElement("p"), detail = document.createElement("p"); detail.className = "meta";
           const actions = document.createElement("div"); actions.className = "actions";
           const retry = this.makeAction("Retry", () => this.app.retryEntry(batch.id));
-          const dismiss = this.makeAction("Dismiss", () => this.app.dismissEntry(batch.id), true);
+          const dismiss = this.makeAction("Discard", () => this.app.dismissEntry(batch.id), true);
           actions.append(retry, dismiss); element.append(title, detail, actions);
           return { element, title, detail, actions, retry, dismiss };
         }, (row, batch) => {
@@ -1457,9 +1507,21 @@ function makeDescription(channel) {
       });
     }
     dismissEntry(id) {
-      if (!window.confirm("Dismiss this entry without sending it?")) return;
+      if (!this.ready || !window.confirm("Discard this unsent entry? This cannot be undone. If its outcome is uncertain, check Toggl first; discarding does not delete anything there.")) return;
       return this.enqueue(async () => {
         await this.ledger.dismiss(id); await this.refresh(); this.publish({ type: "changed" });
+      });
+    }
+    discardChannel(channel) {
+      if (!this.ready || !normalizeChannel(channel) || !window.confirm(`Discard saved unsent time for ${channel.name || channel.id}? This cannot be undone. Queued entries are separate; later playback will still be recorded.`)) return;
+      return this.enqueue(async () => {
+        await this.ledger.discardChannel(channel); await this.refresh(); this.publish({ type: "changed" });
+      });
+    }
+    discardAll() {
+      if (!this.ready || !window.confirm("Discard all saved unsent time and queued entries across YouTube tabs? This cannot be undone. Entries already sending are kept. Uncertain entries may already exist in Toggl; discarding does not delete them there. Later playback will still be recorded.")) return;
+      return this.enqueue(async () => {
+        await this.ledger.discardAll(); await this.refresh(); this.publish({ type: "changed" });
       });
     }
     openChannel() {

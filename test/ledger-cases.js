@@ -168,6 +168,98 @@ globalThis.runLedgerCases = async function runLedgerCases(API) {
   assert(snap.batches.length === 0 && snap.records[0].lastEligibleAtMs === 60000,
     "record detects rollback atomically and another connection does not shift it again");
   results.push("delayed checkpoints use transactional trusted clock context");
+  const [discardA, discardB] = await make();
+  await discardA.record(cp("queued-A", 60000), config);
+  await discardA.finalize(config, { force: true, nowMs: 160000 });
+  const queuedBeforeDiscard = JSON.stringify((await discardA.snapshot()).batches);
+  const shared = (id, duration, channelId) => ({ ...cp(id, duration), channel: { id: channelId, name: "Shared" } });
+  await discardA.record(shared("discard-A", 20000, "A"), config);
+  await discardB.record(shared("keep-B", 30000, "B"), config);
+  await discardB.record(shared("keep-name", 40000, ""), config);
+  await discardA.discardChannel({ id: "A", name: "Shared" });
+  snap = await discardB.snapshot();
+  assert(snap.pendingChannels.reduce((sum, group) => sum + group.durationMs, 0) === 70000,
+    "individual channel discard preserves different IDs and ambiguous name-only credit");
+  assert(JSON.stringify(snap.batches) === queuedBeforeDiscard, "channel discard leaves outgoing batches unchanged");
+  assert(snap.records.find(record => record.id === "discard-A").consumedMs === 20000,
+    "discard consumes the recorded prefix without deleting cumulative history");
+  await discardB.record(shared("discard-A", 20000, "A"), config);
+  await discardB.record({ ...shared("discard-A", 25000, "A"), intervalStartMs: 120000 }, config);
+  snap = await discardA.snapshot();
+  const resumed = snap.pendingChannels.find(group => group.channel.id === "A");
+  assert(resumed.durationMs === 5000 && resumed.firstPlayMs === 120000,
+    "repeated checkpoints cannot resurrect discarded time and continued playback has a fresh start");
+  await discardA.discardChannel({ id: "", name: "shared" });
+  snap = await discardB.snapshot();
+  assert(snap.pendingChannels.length === 2 && snap.pendingChannels.every(group => group.channel.id),
+    "name-only discard cannot consume a same-named identified channel");
+  results.push("individual channel discard, identity isolation, idempotent history, continued playback");
+
+  const [bulkA, bulkB] = await make();
+  const statuses = ["pending", "uncertain", "blocked", "sending", "sent", "dismissed"];
+  for (const status of statuses) await bulkA.record(cp(status, 60000, 100000, status), config);
+  await bulkA.finalize(config, { force: true, nowMs: 160000 });
+  await bulkA.transaction("readwrite", (state, stores) => {
+    for (const batch of state.batches) {
+      batch.status = batch.channel.id; batch.message = "Existing diagnostic";
+      if (batch.status === "sent") batch.togglId = 42;
+      stores.batches.put(batch);
+    }
+    stores.meta.put({ id: "worker", attempts: [160000], quotaUntilMs: 9999999,
+      lastCompletedAtMs: 160000, authBlocked: true });
+  });
+  await bulkB.record(cp("short-unsent", 20000), { ...config, togglWorkspaceId: 0 });
+  const bulkBefore = await bulkA.snapshot();
+  const transaction = bulkA.transaction.bind(bulkA);
+  bulkA.transaction = (mode, operation, readStores) => transaction(mode, (state, stores) => {
+    operation(state, stores); throw new Error("Injected discard abort");
+  }, readStores);
+  let aborted = false;
+  try { await bulkA.discardAll(); } catch (error) { aborted = error.message === "Injected discard abort"; }
+  bulkA.transaction = transaction;
+  assert(aborted && JSON.stringify(await bulkB.snapshot()) === JSON.stringify(bulkBefore),
+    "aborted bulk discard cannot partly consume records or dismiss queue entries");
+  await bulkA.discardAll();
+  snap = await bulkB.snapshot();
+  assert(snap.pendingChannels.length === 0 && snap.records.length === bulkBefore.records.length,
+    "bulk discard consumes short unbatched time without needing destination setup or deleting history");
+  for (const before of bulkBefore.batches) {
+    const after = snap.batches.find(batch => batch.id === before.id);
+    const expected = ["pending", "uncertain", "blocked"].includes(before.status)
+      ? { ...before, status: "dismissed", message: "" } : before;
+    assert(JSON.stringify(after) === JSON.stringify(expected), "bulk discard preserves frozen payloads, sending claims, and sent receipts");
+    assert(!(await bulkB.retry(after.id)) && !(await bulkB.dismiss(after.id)),
+      "stale individual actions cannot retry or discard sending, sent, or discarded entries");
+  }
+  assert(JSON.stringify(snap.meta) === JSON.stringify(bulkBefore.meta.map(item => ({ ...item, authBlocked: false }))),
+    "discard clears the dismissed auth block while retaining request attempts, spacing, and quota state");
+  await bulkA.discardAll();
+  assert(JSON.stringify(await bulkB.snapshot()) === JSON.stringify(snap), "repeated bulk discard is idempotent without new playback");
+  results.push("atomic bulk discard, aborted transaction, protected sending/receipts, retained quota, stale actions");
+
+  for (const claimFirst of [false, true]) {
+    const [raceA, raceB] = await make();
+    await raceA.record(cp("race", 60000), config);
+    await raceA.finalize(config, { force: true, nowMs: 160000 });
+    const id = (await raceA.snapshot()).batches[0].id;
+    const actions = claimFirst ? [() => raceA.claim(config, 200000), () => raceB.discardAll()]
+      : [() => raceB.discardAll(), () => raceA.claim(config, 200000)];
+    await Promise.all(actions.map(action => action()));
+    const batch = (await raceB.snapshot()).batches[0];
+    assert(batch.status === (claimFirst ? "sending" : "dismissed"), "claim and bulk discard serialize across connections");
+    assert(!(await raceB.dismiss(id)), "individual discard cannot override a concurrent claim or resurrect a discarded entry");
+  }
+  for (const finalizeFirst of [false, true]) {
+    const [raceA, raceB] = await make();
+    await raceA.record(cp("race", 60000), config);
+    const actions = finalizeFirst ? [() => raceA.finalize(config, { force: true }), () => raceB.discardAll()]
+      : [() => raceB.discardAll(), () => raceA.finalize(config, { force: true })];
+    await Promise.all(actions.map(action => action()));
+    snap = await raceA.snapshot();
+    assert(snap.pendingChannels.length === 0 && snap.batches.every(batch => batch.status === "dismissed"),
+      "concurrent finalize cannot leave discarded time available for delivery");
+  }
+  results.push("cross-connection discard races with delivery claims and batch allocation");
   if (globalThis.navigator?.locks) {
     const [parallelA, parallelB] = await make();
     await parallelA.record(cp("p1", 60000), config); await parallelB.record(cp("p2", 60000, 100000, "B"), config);

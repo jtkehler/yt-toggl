@@ -1,4 +1,4 @@
-# YouTube Watch Time → Toggl
+# Youtube Toggl Sync
 
 A dependency-free Violentmonkey userscript that records YouTube watch time locally per video, then combines videos from the same channel into completed Toggl Track entries.
 
@@ -46,7 +46,11 @@ The button pulses only while playback has validated progress. An unpaused player
 
 **Sync** asks other live YouTube pages to checkpoint and waits up to 500 ms before freezing the globally available channel totals under the same minimum rule. Suspended or unresponsive pages cannot hold Sync open; their later contributions belong to another batch. Continued playback contributes to the next batch. Without BroadcastChannel, Sync still freezes the already persisted global records.
 
-Outgoing batches have fixed source membership and payloads. Recording more videos cannot change a queued, sending, or uncertain batch. Retry and Dismiss act only on the current permitted state; successful receipts remain recorded locally.
+Outgoing batches have fixed source membership and payloads. Recording more videos cannot change a queued, sending, or uncertain batch. Retry and Discard act only on the current permitted state; successful receipts remain recorded locally.
+
+Use **Discard** on an **Unsent by channel** row to clear that channel's saved, unbatched time, or on a **Delivery** row to discard that individual pending, blocked, or uncertain entry. **Discard all unsent** clears saved unbatched time and all discardable delivery entries across YouTube tabs in one operation. Each action asks for confirmation. Entries already sending are kept, and nothing is deleted from Toggl.
+
+Discard applies to the time already saved when the operation runs. Later playback and checkpoints arriving afterward remain eligible. Cumulative viewing history stays local so repeated checkpoints cannot restore discarded time; the current video's recorded total therefore still includes discarded time. Discard works before credentials are configured and when delivery is unavailable.
 
 ## Storage and delivery
 
@@ -58,7 +62,7 @@ Delivery requires native Web Locks, available in modern Firefox and Chromium bro
 
 Requests use `POST /api/v9/workspaces/{workspace_id}/time_entries`, Basic token authentication, `created_with: "yt-toggl"`, a positive duration, and a UTC start. `stop` is omitted; `project_id` is omitted when null.
 
-Quota and rate-limit rejections remain pending. Authentication and other nonretryable rejections become blocked. Timeouts, network/interrupted sends, HTTP 408, and 5xx responses become **uncertain**. Check Toggl before explicitly retrying or dismissing: local transactions cannot guarantee that a remote create request did not succeed.
+Quota and rate-limit rejections remain pending. Authentication and other nonretryable rejections become blocked. Timeouts, network/interrupted sends, HTTP 408, and 5xx responses become **uncertain**. Check Toggl before explicitly retrying or discarding: local transactions cannot guarantee that a remote create request did not succeed.
 
 Nothing runs while all YouTube pages are closed. Persisted records are finalized and queued work resumes when another page runs the userscript. The last uncheckpointed interval can be lost if a page or browser closes abruptly.
 
@@ -78,6 +82,6 @@ Native IndexedDB and Shadow DOM checks run in an isolated headless Firefox profi
 npm run test:browser
 ```
 
-Firefox defaults to `/usr/bin/firefox`; set `FIREFOX_BIN` to another executable path. The runner uses a local HTTP server, a disposable profile, native database/Web Locks, and mocked delivery. Tests cover concurrent writes, idempotent checkpoints, channel thresholds, exact inactivity, immutable allocation, uncertain recovery, request spacing, clock rollback, real keyboard focus, and status actions. They make no real YouTube or Toggl requests and do not establish live YouTube DOM compatibility.
+Firefox defaults to `/usr/bin/firefox`; set `FIREFOX_BIN` to another executable path. The runner uses a local HTTP server, a disposable profile, native database/Web Locks, and mocked delivery. Tests cover concurrent writes, idempotent checkpoints, channel thresholds, exact inactivity, immutable allocation, uncertain recovery, request spacing, clock rollback, real keyboard focus, and status actions. Discard checks include individual scopes, cancellation, atomic bulk changes, delivery races, and continued playback. They make no real YouTube or Toggl requests and do not establish live YouTube DOM compatibility.
 
 API references: [Toggl time entries](https://engineering.toggl.com/docs/track/api/time_entries/), [authentication](https://engineering.toggl.com/docs/authentication/), [quotas and rate limits](https://engineering.toggl.com/docs/track/), [Violentmonkey privileged APIs](https://violentmonkey.github.io/api/gm/).
