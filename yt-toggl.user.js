@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Youtube Toggl Sync
 // @namespace    https://github.com/jtkehler/yt-toggl
-// @version      2.1.0
+// @version      2.2.0
 // @description  Track eligible YouTube playback locally and create completed Toggl entries.
 // @author       jtkehler
 // @homepageURL  https://github.com/jtkehler/yt-toggl
@@ -27,9 +27,10 @@ const CONFIG = {
   togglWorkspaceId: 0,       // Required positive integer workspace ID for new entries.
   togglProjectId: null,      // Positive integer project ID in that workspace; null omits the project.
   inactivityMinutes: 10,     // Minutes without validated playback across tabs before a channel closes; must be > 0.
-  minimumDurationMinutes: 1, // Minimum combined playback minutes per channel; 0 disables the minimum.
-  mergeBelowMinimum: true,   // true keeps short time for the same channel; false discards it on closure.
-  dayBoundary: null,         // Local "HH:MM" cutoff (e.g. "04:00"); earlier batch starts use previous day's 23:59; null disables.
+  minimumDurationMinutes: 1, // Minimum playback minutes including available carry; 0 disables the minimum.
+  mergeBelowMinimum: true,   // true carries short time into the next closing channel; false discards new short time.
+  mergedEntryDescription: "YouTube — merged", // Manual Merge & Sync description; "" creates an unnamed entry.
+  dayBoundary: null,         // Local "HH:MM" cutoff (e.g. "04:00") for ordinary entries; merged entries use today's date.
   maxRequestsPerHour: 30,    // Positive integer cap on delivery attempts per rolling hour, shared across tabs.
 };
 
@@ -70,6 +71,23 @@ function makeDescription(channel) {
 
   function minimumDurationMs(config = CONFIG) {
     return Math.max(0, finiteNumber(config.minimumDurationMinutes, 1)) * 60 * 1000;
+  }
+
+  function belowMinimum(durationMs, config = CONFIG) {
+    return durationMs < minimumDurationMs(config) || Math.round(durationMs / 1000) < 1;
+  }
+
+  function mergedEntryDescription(config = CONFIG) {
+    return config.mergedEntryDescription === undefined ? CONFIG.mergedEntryDescription : config.mergedEntryDescription;
+  }
+
+  function allocationConfigured(config) {
+    return Number.isFinite(dayBoundaryMinutes(config)) &&
+      Number.isFinite(Number(config.minimumDurationMinutes)) && Number(config.minimumDurationMinutes) >= 0 &&
+      Number.isFinite(Number(config.inactivityMinutes)) && Number(config.inactivityMinutes) > 0 &&
+      typeof config.mergeBelowMinimum === "boolean" && typeof mergedEntryDescription(config) === "string" &&
+      Number.isInteger(Number(config.togglWorkspaceId)) && Number(config.togglWorkspaceId) > 0 &&
+      (config.togglProjectId === null || (Number.isInteger(Number(config.togglProjectId)) && Number(config.togglProjectId) > 0));
   }
 
   function dayBoundaryMinutes(config = CONFIG) {
@@ -271,6 +289,7 @@ function makeDescription(channel) {
       errors.push("CONFIG.maxRequestsPerHour must be a positive integer.");
     }
     if (typeof config.mergeBelowMinimum !== "boolean") errors.push("CONFIG.mergeBelowMinimum must be a boolean.");
+    if (typeof mergedEntryDescription(config) !== "string") errors.push('CONFIG.mergedEntryDescription must be a string; use "" for no description.');
     if (!Number.isFinite(dayBoundaryMinutes(config))) errors.push('CONFIG.dayBoundary must be null or a 24-hour time in HH:MM format (00:00–23:59).');
     return errors;
   }
@@ -717,10 +736,10 @@ function makeDescription(channel) {
           reject(new Error("IndexedDB is unavailable. Allow YouTube site storage to record playback."));
           return;
         }
-        const request = this.indexedDB.open(this.name, 1);
+        const request = this.indexedDB.open(this.name, 2);
         request.onupgradeneeded = () => {
           const db = request.result;
-          for (const name of ["records", "batches", "meta"]) {
+          for (const name of ["records", "batches", "meta", "carry"]) {
             if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: "id" });
           }
         };
@@ -735,12 +754,12 @@ function makeDescription(channel) {
       return this.openPromise;
     }
 
-    async transaction(mode, operation, readStores = ["records", "batches", "meta"]) {
+    async transaction(mode, operation, readStores = ["records", "batches", "meta", "carry"]) {
       await this.open();
       return new Promise((resolve, reject) => {
-        const tx = this.db.transaction(["records", "batches", "meta"], mode);
-        const stores = Object.fromEntries(["records", "batches", "meta"].map((name) => [name, tx.objectStore(name)]));
-        const state = { records: [], batches: [], meta: [] };
+        const tx = this.db.transaction(["records", "batches", "meta", "carry"], mode);
+        const stores = Object.fromEntries(["records", "batches", "meta", "carry"].map((name) => [name, tx.objectStore(name)]));
+        const state = { records: [], batches: [], meta: [], carry: [] };
         let remaining = readStores.length; let result; let operationError;
         tx.oncomplete = () => resolve(result);
         tx.onerror = () => reject(operationError || tx.error || new Error("Playback storage transaction failed."));
@@ -757,10 +776,7 @@ function makeDescription(channel) {
       });
     }
 
-    groups(records) {
-      // Fully consumed history must not extend live inactivity or make current
-      // name-only attribution ambiguous merely because a former channel shared it.
-      records = records.filter((record) => record.durationMs > record.consumedMs);
+    channelGroups(records) {
       const groups = [];
       // Stable IDs define groups first; a name-only record joins only an unambiguous ID.
       for (const record of records.filter((item) => item.channel.id)) {
@@ -774,7 +790,12 @@ function makeDescription(channel) {
         if (!group) { group = { channel: clone(record.channel), records: [] }; groups.push(group); }
         group.records.push(record);
       }
-      return groups.map((group) => {
+      return groups;
+    }
+
+    groups(records) {
+      // Consumed history belongs to carry/batches/discards, not live channels.
+      return this.channelGroups(records.filter(record => record.durationMs > record.consumedMs)).map((group) => {
         const pending = group.records.filter((record) => record.durationMs > record.consumedMs);
         return { ...group, pending,
           durationMs: pending.reduce((total, record) => total + record.durationMs - record.consumedMs, 0),
@@ -784,30 +805,81 @@ function makeDescription(channel) {
       });
     }
 
-    allocate(group, config, nowMs, stores) {
-      if (group.durationMs <= 0) return null;
-      const belowMinimum = group.durationMs < minimumDurationMs(config) || Math.round(group.durationMs / 1000) < 1;
-      if (belowMinimum && config.mergeBelowMinimum) return null;
-      const boundaryMinutes = dayBoundaryMinutes(config);
-      // Capture works before setup; freeze a payload only once its settings are usable.
-      if (!belowMinimum && (!Number.isFinite(boundaryMinutes) || !Number.isInteger(Number(config.togglWorkspaceId)) || Number(config.togglWorkspaceId) <= 0 ||
-          (config.togglProjectId !== null && (!Number.isInteger(Number(config.togglProjectId)) || Number(config.togglProjectId) <= 0)))) return null;
-      const sources = group.pending.map((record) => ({ recordId: record.id, fromMs: record.consumedMs,
+    carryState(state) {
+      const item = Array.isArray(state.carry) ? state.carry.find(item => item.id === "global") : state.carry;
+      const sources = item?.sources || [];
+      return { id: "global", sources, durationMs: sources.reduce((sum, source) => sum + source.durationMs, 0) };
+    }
+
+    writeCarry(carry, sources, stores) {
+      carry.sources = sources;
+      carry.durationMs = sources.reduce((sum, source) => sum + source.durationMs, 0);
+      stores.carry.put(carry);
+    }
+
+    sources(records) {
+      return records.map((record) => ({ recordId: record.id, fromMs: record.consumedMs,
         toMs: record.durationMs, durationMs: record.durationMs - record.consumedMs, startMs: record.pendingStartMs }));
-      for (const record of group.pending) {
+    }
+
+    consume(records, stores) {
+      for (const record of records) {
         record.consumedMs = record.durationMs;
         record.pendingStartMs = null;
         stores.records.put(record);
       }
-      if (belowMinimum) return null;
-      const batch = { id: randomId("batch"), channel: clone(group.channel),
-        description: typeof makeDescription === "function" ? makeDescription(clone(group.channel)) : group.channel.name || group.channel.id || "YouTube",
-        start: togglStartTime(group.firstPlayMs, boundaryMinutes), duration: Math.round(group.durationMs / 1000),
-        durationMs: group.durationMs, workspaceId: Number(config.togglWorkspaceId),
+    }
+
+    queueBatch(channel, sources, config, nowMs, stores, { merged = false, description } = {}) {
+      const durationMs = sources.reduce((sum, source) => sum + source.durationMs, 0);
+      const batch = { id: randomId("batch"), channel: clone(channel), merged,
+        description: description === undefined ? makeDescription(clone(channel)) : description,
+        start: merged ? new Date(nowMs).toISOString() : togglStartTime(Math.min(...sources.map(source => source.startMs)), dayBoundaryMinutes(config)),
+        duration: Math.round(durationMs / 1000), durationMs, workspaceId: Number(config.togglWorkspaceId),
         projectId: config.togglProjectId === null ? null : Number(config.togglProjectId),
         sources, createdAtMs: nowMs, status: "pending", nextAttemptAtMs: 0, message: "" };
       stores.batches.add(batch);
       return batch;
+    }
+
+    allocate(group, config, nowMs, stores, carry = { id: "global", sources: [], durationMs: 0 }) {
+      if (group.durationMs <= 0) return null;
+      const carried = config.mergeBelowMinimum ? carry.sources : [];
+      const sources = [...carried, ...this.sources(group.pending)];
+      const short = belowMinimum(sources.reduce((sum, source) => sum + source.durationMs, 0), config);
+      if ((config.mergeBelowMinimum || !short) && !allocationConfigured(config)) return null;
+      this.consume(group.pending, stores);
+      if (short) {
+        if (config.mergeBelowMinimum) this.writeCarry(carry, sources, stores);
+        return null;
+      }
+      const batch = this.queueBatch(group.channel, sources, config, nowMs, stores, { merged: carried.length > 0 });
+      if (carried.length) this.writeCarry(carry, [], stores);
+      return batch;
+    }
+
+    closeGroups(state, stores, config, cutoffMs, nowMs, force = false) {
+      if (config.mergeBelowMinimum && !allocationConfigured(config)) return [];
+      const key = group => group.channel.id ? `id:${group.channel.id}` : `name:${group.channel.name.toLowerCase()}`;
+      const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+      const groups = this.groups(state.records).filter(group => force || group.lastEligibleAtMs + inactivityMs(config) <= cutoffMs)
+        .sort((a, b) => a.lastEligibleAtMs - b.lastEligibleAtMs || compare(key(a), key(b)));
+      const carry = this.carryState(state);
+      const created = [];
+      for (const group of groups) {
+        const batch = this.allocate(group, config, nowMs, stores, carry);
+        if (batch) created.push(batch);
+      }
+      return created;
+    }
+
+    other(state, config = CONFIG) {
+      const groups = this.groups(state.records).filter(group => belowMinimum(group.durationMs, config));
+      const carry = this.carryState(state);
+      const sources = [...carry.sources, ...groups.flatMap(group => this.sources(group.pending))];
+      const ids = new Set(sources.map(source => source.recordId));
+      return { groups, sources, durationMs: sources.reduce((sum, source) => sum + source.durationMs, 0),
+        carryMs: carry.durationMs, channelCount: this.channelGroups(state.records.filter(record => ids.has(record.id))).length };
     }
 
     async record(checkpoint, config = CONFIG, timeContext = null) {
@@ -837,15 +909,7 @@ function makeDescription(channel) {
           throw new Error("A viewing record cannot change video or channel identity.");
         }
         if (record && checkpoint.durationMs <= record.durationMs) return [];
-        const created = [];
-        const matches = this.groups(state.records).filter((group) => channelsEqual(group.channel, checkpoint.channel));
-        const previous = checkpoint.channel.id
-          ? matches.find((group) => group.channel.id === checkpoint.channel.id) || (matches.length === 1 ? matches[0] : null)
-          : matches.length === 1 ? matches[0] : null;
-        if (previous && activityStartMs >= previous.lastEligibleAtMs + inactivityMs(config)) {
-          const batch = this.allocate(previous, config, observedNowMs, stores);
-          if (batch) created.push(batch);
-        }
+        const created = this.closeGroups(state, stores, config, activityStartMs, observedNowMs);
         if (!record) {
           record = { id: checkpoint.id, videoId: checkpoint.videoId, title: normalizedText(checkpoint.title),
             channel: normalizeChannel(checkpoint.channel), firstPlayMs: checkpoint.firstPlayMs,
@@ -865,7 +929,7 @@ function makeDescription(channel) {
         record.title = normalizedText(checkpoint.title) || record.title;
         stores.records.put(record);
         return created;
-      }, ["records", "meta"]);
+      }, ["records", "meta", "carry"]);
     }
 
     finalize(config = CONFIG, { nowMs = Date.now(), force = false } = {}) {
@@ -873,14 +937,8 @@ function makeDescription(channel) {
         const trustedClock = typeof nowMs === "function";
         const observedNowMs = trustedClock ? nowMs() : nowMs;
         if (trustedClock) this.shiftClock(state, stores, observedNowMs);
-        const created = [];
-        for (const group of this.groups(state.records)) {
-          if (!force && observedNowMs < group.lastEligibleAtMs + inactivityMs(config)) continue;
-          const batch = this.allocate(group, config, observedNowMs, stores);
-          if (batch) created.push(batch);
-        }
-        return created;
-      }, ["records", "meta"]);
+        return this.closeGroups(state, stores, config, observedNowMs, observedNowMs, force);
+      }, ["records", "meta", "carry"]);
     }
 
     observeClock(nowValue = () => Date.now()) {
@@ -911,11 +969,35 @@ function makeDescription(channel) {
 
     snapshot() {
       return this.transaction("readonly", (state) => ({ ...state,
+        carry: this.carryState(state),
         pendingChannels: this.groups(state.records).filter((group) => group.durationMs > 0).map((group) => ({
           channel: group.channel, durationMs: group.durationMs, firstPlayMs: group.firstPlayMs,
           lastEligibleAtMs: group.lastEligibleAtMs,
         })),
       }));
+    }
+
+    mergeOther(config = CONFIG, { nowMs = () => Date.now() } = {}) {
+      return this.transaction("readwrite", (state, stores) => {
+        if (!allocationConfigured(config)) return null;
+        const now = typeof nowMs === "function" ? nowMs() : nowMs;
+        if (typeof nowMs === "function") this.shiftClock(state, stores, now);
+        const other = this.other(state, config);
+        if (Math.round(other.durationMs / 1000) < 1) return null;
+        const batch = this.queueBatch(null, other.sources, config, now, stores,
+          { merged: true, description: mergedEntryDescription(config) });
+        this.consume(other.groups.flatMap(group => group.pending), stores);
+        if (other.carryMs > 0) this.writeCarry(this.carryState(state), [], stores);
+        return batch;
+      }, ["records", "meta", "carry"]);
+    }
+
+    discardOther(config = CONFIG) {
+      return this.transaction("readwrite", (state, stores) => {
+        const other = this.other(state, config);
+        this.consume(other.groups.flatMap(group => group.pending), stores);
+        if (other.carryMs > 0) this.writeCarry(this.carryState(state), [], stores);
+      }, ["records", "carry"]);
     }
 
     retry(id) {
@@ -969,6 +1051,8 @@ function makeDescription(channel) {
           record.consumedMs = record.durationMs; record.pendingStartMs = null;
           stores.records.put(record);
         }
+        const carry = this.carryState(state);
+        if (carry.durationMs > 0) this.writeCarry(carry, [], stores);
         let wasBlocked = false;
         for (const batch of state.batches) {
           if (!["pending", "uncertain", "blocked"].includes(batch.status)) continue;
@@ -1399,30 +1483,42 @@ function makeDescription(channel) {
       const observedChannel = current?.channel || record?.channel;
       this.text("channel", observedChannel?.name || observedChannel?.id || "");
       const pending = view.pendingChannels.find((group) => channelsEqual(group.channel, observedChannel));
+      const other = app.ledger.other(view, app.config);
       const left = Math.max(0, minimumDurationMs(app.config) - (pending?.durationMs || 0));
-      this.text("threshold-caption", pending ? (left ? `${formatDuration(left)} UNTIL CHANNEL MINIMUM` : "CHANNEL MINIMUM REACHED") : "");
+      const threshold = pending ? (left ? `${formatDuration(left)} UNTIL CHANNEL MINIMUM` : "CHANNEL MINIMUM REACHED") : "";
+      this.text("threshold-caption", pending && app.config.mergeBelowMinimum && other.carryMs > 0
+        ? `${formatDuration(pending.durationMs)} CHANNEL · ${formatDuration(other.carryMs)} SHARED CARRY` : threshold);
       this.text("error", errors.join(" "));
       this.shadow.getElementById("error").hidden = !errors.length;
       this.shadow.getElementById("clear-error").hidden = !app.error;
       this.shadow.getElementById("sync").disabled = !app.ready;
       this.shadow.getElementById("discard-all").disabled = !app.ready ||
-        !(view.pendingChannels.length || view.batches.some((batch) => ["pending", "uncertain", "blocked"].includes(batch.status)));
-      this.rows("channels", this.channelRows, view.pendingChannels,
-        (group) => group.channel.id || `name:${group.channel.name.toLowerCase()}`,
-        () => {
+        !(view.pendingChannels.length || other.carryMs > 0 || view.batches.some((batch) => ["pending", "uncertain", "blocked"].includes(batch.status)));
+      const displayed = view.pendingChannels.filter(group => !belowMinimum(group.durationMs, app.config));
+      if (other.durationMs > 0) displayed.push({ ...other, other: true });
+      this.rows("channels", this.channelRows, displayed,
+        (group) => group.other ? "other" : group.channel.id ? `id:${group.channel.id}` : `name:${group.channel.name.toLowerCase()}`,
+        (group) => {
           const element = document.createElement("div"); element.className = "item";
           const title = document.createElement("p"), detail = document.createElement("p"); detail.className = "meta";
           const actions = document.createElement("div"); actions.className = "actions";
-          const row = { element, title, detail, channel: null };
-          row.discard = this.makeAction("Discard", () => this.app.discardChannel(row.channel), true);
+          const row = { element, title, detail, channel: null, other: Boolean(group.other) };
+          if (row.other) {
+            row.merge = this.makeAction("Merge & Sync", () => this.app.mergeOther());
+            actions.append(row.merge);
+          }
+          row.discard = this.makeAction("Discard", () => row.other ? this.app.discardOther() : this.app.discardChannel(row.channel), true);
           actions.append(row.discard); element.append(title, detail, actions); return row;
         }, (row, group) => {
           row.channel = group.channel;
           row.discard.disabled = !app.ready;
-          const title = `${group.channel.name || group.channel.id} · ${formatDuration(group.durationMs)}`;
+          if (row.merge) row.merge.disabled = !app.ready || Math.round(group.durationMs / 1000) < 1;
+          const title = `${group.other ? "Other" : group.channel.name || group.channel.id} · ${formatDuration(group.durationMs)}`;
           if (row.title.textContent !== title) row.title.textContent = title;
           const remaining = Math.max(0, group.lastEligibleAtMs + inactivityMs(app.config) - Date.now());
-          const detail = remaining > 0 ? `Closes after ${formatDuration(remaining)} without playback` : "Waiting for channel minimum or sync";
+          const detail = group.other
+            ? `${group.channelCount} ${group.channelCount === 1 ? "channel" : "channels"} · ${formatDuration(group.carryMs)} carried · ${formatDuration(group.durationMs - group.carryMs)} awaiting closure`
+            : remaining > 0 ? `Closes after ${formatDuration(remaining)} without playback` : "Waiting to close";
           if (row.detail.textContent !== detail) row.detail.textContent = detail;
         });
       this.rows("decisions", this.batchRows, view.batches.filter((batch) => ["pending", "sending", "uncertain", "blocked"].includes(batch.status)),
@@ -1435,7 +1531,7 @@ function makeDescription(channel) {
           actions.append(retry, dismiss); element.append(title, detail, actions);
           return { element, title, detail, actions, retry, dismiss };
         }, (row, batch) => {
-          const title = `${batch.status}: ${batch.description} · ${formatDuration(batch.duration * 1000)}`;
+          const title = `${batch.status}: ${batch.description || "(No description)"} · ${formatDuration(batch.duration * 1000)}`;
           if (row.title.textContent !== title) row.title.textContent = title;
           const detail = `${batch.start} · Workspace ${batch.workspaceId || ""}${batch.projectId ? ` / Project ${batch.projectId}` : ""}${batch.message ? ` · ${batch.message}` : ""}`;
           if (row.detail.textContent !== detail) row.detail.textContent = detail;
@@ -1512,17 +1608,36 @@ function makeDescription(channel) {
         this.error = error?.message || String(error); this.status.render();
       });
     }
-    async sync() {
-      if (!this.ready) return;
+    async checkpointObservers() {
       this.publish({ type: "sync" });
       await this.tick({ finalize: false });
       // Give live pages a bounded opportunity to flush; a suspended page cannot
       // hold a global Sync open. Its later contributions start another batch.
       await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    async sync() {
+      if (!this.ready) return;
+      await this.checkpointObservers();
       return this.enqueue(async () => {
         await this.flush();
         await this.ledger.finalize(this.config, { nowMs: () => Date.now(), force: true });
         await this.refresh(); this.publish({ type: "changed" }); this.kickWorker();
+      });
+    }
+    async mergeOther() {
+      if (!this.ready) return;
+      await this.checkpointObservers();
+      return this.enqueue(async () => {
+        await this.flush();
+        await this.ledger.mergeOther(this.config, { nowMs: () => Date.now() });
+        await this.refresh(); this.publish({ type: "changed" }); this.kickWorker();
+      });
+    }
+    discardOther() {
+      if (!this.ready || !window.confirm("Discard all saved time shown in Other? This cannot be undone. Later playback will still be recorded.")) return;
+      return this.enqueue(async () => {
+        await this.ledger.discardOther(this.config);
+        await this.refresh(); this.publish({ type: "changed" });
       });
     }
     retryEntry(id) {

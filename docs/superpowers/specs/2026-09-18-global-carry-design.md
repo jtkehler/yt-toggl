@@ -131,7 +131,8 @@ request, then recompute membership from authoritative records inside one
 transaction: a channel that has reached the minimum is now a separate named row
 and is not included by this action.
 
-Create one batch described as **YouTube — merged**, bypassing the configured
+Create one batch described by `CONFIG.mergedEntryDescription` (default
+**YouTube — merged**), bypassing the configured
 minimum and inactivity wait. Round once after combining milliseconds. If the
 result rounds to zero seconds, leave it saved rather than consuming it. If another
 operation has already consumed all applicable time, return a harmless no-op.
@@ -142,6 +143,12 @@ The manual action does not merge or change items already in Delivery. It uses th
 existing worker to send its new batch and continues to record playback while
 delivery is pending. No additional channel-selection interface is needed for the
 collapsed Other row.
+
+The user additionally requested a configurable manual-merge name, including no
+name. `mergedEntryDescription` accepts any string, including `""` for an unnamed
+entry. Pass the empty string through to Toggl, and display **(No description)**
+locally for an unnamed queued entry. Freeze the configured text in the batch;
+automatic carry continues to use the receiving channel's description.
 
 ## Dates and frozen payloads
 

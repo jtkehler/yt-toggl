@@ -120,6 +120,18 @@ test("minimum zero is supported and merge mode must be a boolean", () => {
   assert.ok(api.validateConfig(cfg({ mergeBelowMinimum: "false" })).length > 0);
 });
 
+test("manual merge descriptions allow empty text and reject non-string values", () => {
+  for (const mergedEntryDescription of ["YouTube", "", undefined]) {
+    assert.deepEqual(api.validateConfig(cfg({ mergedEntryDescription })), []);
+  }
+  for (const mergedEntryDescription of [null, 0, false, {}]) {
+    assert.ok(api.validateConfig(cfg({ mergedEntryDescription })).some(error => error.includes("mergedEntryDescription")));
+  }
+  const request = api.buildTogglRequest({ description: "", duration: 5,
+    start: "2026-09-18T12:00:00Z", workspaceId: 123, projectId: null }, cfg());
+  assert.equal(request.body.description, "");
+});
+
 function allocateAt(start, overrides = {}) {
   const firstPlayMs = Date.parse(start);
   const record = { id: "boundary-record", videoId: "boundary-video", title: "Boundary video", channel,

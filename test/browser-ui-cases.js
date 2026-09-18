@@ -16,7 +16,7 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     config: { togglApiToken: "local-fixture", togglWorkspaceId: 123, togglProjectId: null,
       inactivityMinutes: 1, minimumDurationMinutes: 1, mergeBelowMinimum: true,
       maxRequestsPerHour: 30 },
-    ready: true, error: "", worker: { capabilityError: "" },
+    ready: true, error: "", worker: { capabilityError: "" }, ledger: new API.VideoLedger(),
     currentSnapshot: { videoId: record.videoId, title: record.title, channel,
       paused: false, ended: false, seeking: false, readyState: 4, ad: false },
     recorder: { record, creditedMs: 1000 },
@@ -29,6 +29,8 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     dismissEntry(id) { calls.push(["dismiss", id]); },
     discardChannel(value) { calls.push(["discard-channel", value.id]); },
     discardAll() { calls.push(["discard-all"]); },
+    mergeOther() { calls.push(["merge-other"]); },
+    discardOther() { calls.push(["discard-other"]); },
     clearError() { this.error = ""; calls.push(["clear"]); },
   };
   const status = new API.StatusControl(app);
@@ -115,6 +117,45 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     status.render();
     assert(findAction("Discard").disabled, "queued entry discard waits for ledger readiness");
     results.push("validated stalled state, resolved attention, clearable errors, capability and readiness states");
+    app.ready = true;
+    const shortRecord = (id, durationMs) => ({ ...record, id, videoId: id, channel: { id, name: id },
+      durationMs, consumedMs: 0, pendingStartMs: start, lastEligibleAtMs: Date.now() });
+    const records = [shortRecord("Short A", 20000), shortRecord("Short B", 25000), shortRecord("Named C", 70000),
+      { ...shortRecord("Carried D", 15000), consumedMs: 15000, pendingStartMs: null }];
+    const setView = (carrySources = []) => {
+      app.view = { ...app.view, records, pendingChannels: app.ledger.groups(records),
+        carry: { id: "global", sources: carrySources }, batches: [{ ...batch, status: "pending", description: "" }] };
+      status.render();
+    };
+    const findOther = () => Array.from(channels.children).find(row => row.querySelector("p")?.textContent.startsWith("Other ·"));
+    setView();
+    assert(channels.children.length === 2 && findOther()?.textContent.includes("0:45") && channels.textContent.includes("Named C"),
+      "all short channels collapse into one Other row while qualifying channels remain named");
+    const carrySources = [{ recordId: "Carried D", fromMs: 0, toMs: 15000, durationMs: 15000, startMs: start }];
+    setView(carrySources);
+    const otherRow = findOther();
+    assert(channels.children.length === 2 && otherRow.textContent.includes("1:00") && otherRow.textContent.includes("3 channels"),
+      "Other counts carried and short active credit once and remains collapsed above the minimum");
+    assert(decisions.textContent.includes("(No description)"), "unnamed batches have a readable local label");
+    const mergeOther = Array.from(otherRow.querySelectorAll("button")).find(button => button.textContent === "Merge & Sync");
+    const discardOther = Array.from(otherRow.querySelectorAll("button")).find(button => button.textContent === "Discard");
+    mergeOther.focus(); setView(carrySources);
+    assert(findOther() === otherRow && shadow.activeElement === mergeOther, "Other actions retain their nodes and keyboard focus");
+    mergeOther.click(); discardOther.click();
+    assert(JSON.stringify(calls.slice(-2)) === JSON.stringify([["merge-other"], ["discard-other"]]), "Other actions target their own scope");
+    records[0].durationMs = 60000; setView(carrySources);
+    assert(channels.children.length === 3 && findOther().textContent.includes("0:40") && channels.textContent.includes("Short A"),
+      "a channel reaching the minimum leaves Other without reclaiming existing carry");
+    for (const item of records) item.consumedMs = item.durationMs;
+    setView(carrySources);
+    app.view.batches = []; status.render();
+    assert(channels.children.length === 1 && findOther().textContent.includes("0:15") && !discardAll.disabled,
+      "carry-only state remains visible and enables bulk discard");
+    app.ready = false; status.render();
+    assert(mergeOther.disabled && discardOther.disabled, "Other actions wait for ledger readiness");
+    app.ready = true; setView();
+    assert(channels.children.length === 0, "empty Other row disappears");
+    results.push("Other aggregation, threshold transitions, carry-only controls, unnamed descriptions, stable focus");
     status.toggle(false);
     assert(shadow.getElementById("panel").hidden && summary.getAttribute("aria-expanded") === "false",
       "closing panel updates native visibility and accessibility state");

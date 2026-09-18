@@ -17,6 +17,225 @@ globalThis.runLedgerCases = async function runLedgerCases(API) {
     const a = new VideoLedger({ name }); const b = new VideoLedger({ name });
     await Promise.all([a.open(), b.open()]); return [a, b];
   };
+  const [carryFirst] = await make();
+  await carryFirst.record(cp("carry-a", 20000, 100000, "A"), config);
+  await carryFirst.finalize(config, { nowMs: 180000 });
+  await carryFirst.record(cp("carry-b", 25000, 200000, "B"), config);
+  await carryFirst.finalize(config, { nowMs: 285000 });
+  await carryFirst.record(cp("carry-c", 30000, 300000, "C"), config);
+  await carryFirst.finalize(config, { nowMs: 390000 });
+  const firstCarrySnapshot = await carryFirst.snapshot();
+  assert(firstCarrySnapshot.batches.length === 1 && firstCarrySnapshot.batches[0].duration === 75 &&
+    firstCarrySnapshot.batches[0].channel.id === "C", "closed short channels must merge into the next closing channel");
+  assert(firstCarrySnapshot.carry.durationMs === 0 && firstCarrySnapshot.batches[0].sources.length === 3,
+    "merged batch claims the three original sources and clears carry");
+  results.push("automatic global carry into next closing channel");
+  const [manual] = await make();
+  await manual.record(cp("manual-carry", 20000), config);
+  await manual.finalize(config, { nowMs: 180000 });
+  await manual.record(cp("manual-short", 15000, 200000, "B"), config);
+  await manual.record(cp("manual-named", 60000, 200000, "C"), config);
+  const merged = await manual.mergeOther({ ...config, mergedEntryDescription: "", dayBoundary: "04:00" }, { nowMs: 300000 });
+  assert(merged.duration === 35 && merged.description === "" && merged.merged && merged.start === new Date(300000).toISOString(),
+    "manual merge bypasses minimum, permits no description, and freezes creation time without day cutoff");
+  let manualSnapshot = await manual.snapshot();
+  assert(manualSnapshot.pendingChannels.length === 1 && manualSnapshot.pendingChannels[0].channel.id === "C" &&
+    manualSnapshot.carry.durationMs === 0, "manual merge consumes only Other and preserves named channels");
+  assert(manualSnapshot.records.find(record => record.id === "manual-short").durationMs === 15000,
+    "merging never changes the original video's recorded history");
+  assert(await manual.mergeOther(config, { nowMs: 300001 }) === null, "repeated empty manual merge cannot duplicate time");
+  const [fraction] = await make();
+  await fraction.record(cp("fraction", 400), config);
+  assert(await fraction.mergeOther(config, { nowMs: 100400 }) === null, "rounded-zero manual total remains saved");
+  assert((await fraction.snapshot()).records[0].consumedMs === 0, "rounded-zero merge does not consume sources");
+  await fraction.record({ ...cp("fraction", 600), intervalStartMs: 100400 }, config);
+  const fractionBatch = await fraction.mergeOther({ ...config, mergedEntryDescription: "Custom title" }, { nowMs: 100600 });
+  assert(fractionBatch.duration === 1 && fractionBatch.description === "Custom title", "manual merge rounds only the combined total and uses configured text");
+  results.push("manual Other scope, empty/custom descriptions, merge dates, rounding and idempotency");
+
+  // The upgrade must keep the accumulated backlog and every delivery state.
+  const upgradeName = `upgrade-${Math.random()}`;
+  let oldClosed = false;
+  const oldDatabase = await new Promise((resolve, reject) => {
+    const request = indexedDB.open(upgradeName, 1);
+    request.onupgradeneeded = () => {
+      for (const name of ["records", "batches", "meta"]) request.result.createObjectStore(name, { keyPath: "id" });
+    };
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+  });
+  const oldRecord = { ...cp("upgrade-short", 20000), consumedMs: 0, pendingStartMs: 100000 };
+  const oldBatches = ["pending", "uncertain", "blocked", "sending", "sent", "dismissed"].map(status => ({
+    id: `old-${status}`, status, channel: { id: "Old", name: "Old" }, description: "Old",
+    duration: 60, durationMs: 60000, sources: [], start: new Date(100000).toISOString(),
+    workspaceId: 123, projectId: null, createdAtMs: 160000, nextAttemptAtMs: 0, message: "Saved state",
+  }));
+  await new Promise((resolve, reject) => {
+    const tx = oldDatabase.transaction(["records", "batches", "meta"], "readwrite");
+    tx.objectStore("records").put(oldRecord);
+    for (const batch of oldBatches) tx.objectStore("batches").put(batch);
+    tx.objectStore("meta").put({ id: "worker", attempts: [160000], quotaUntilMs: 200000, lastCompletedAtMs: 160000 });
+    tx.oncomplete = resolve; tx.onabort = () => reject(tx.error);
+  });
+  oldDatabase.onversionchange = () => { oldClosed = true; oldDatabase.close(); };
+  const upgraded = new VideoLedger({ name: upgradeName }); await upgraded.open();
+  const upgradedSnapshot = await upgraded.snapshot();
+  assert(oldClosed && upgraded.db.version === 2 && upgraded.db.objectStoreNames.contains("carry"),
+    "upgrade closes the old connection and adds durable carry in the existing database");
+  assert(JSON.stringify(upgradedSnapshot.records[0]) === JSON.stringify(oldRecord) &&
+    oldBatches.every(old => JSON.stringify(upgradedSnapshot.batches.find(batch => batch.id === old.id)) === JSON.stringify(old)) &&
+    upgradedSnapshot.meta[0].attempts[0] === 160000, "upgrade preserves saved credit, immutable payloads, all delivery states, and rate metadata");
+  const oldVersionError = await new Promise(resolve => {
+    const request = indexedDB.open(upgradeName, 1);
+    request.onerror = () => resolve(request.error.name);
+    request.onsuccess = () => { request.result.close(); resolve("unexpected open"); };
+  });
+  assert(oldVersionError === "VersionError", "old script cannot reopen the upgraded ledger and consume carry sources again");
+  await upgraded.finalize(config, { nowMs: 180000 });
+  assert((await upgraded.snapshot()).carry.durationMs === 20000, "pre-upgrade short credit enters carry without migration loss");
+  results.push("in-place ledger upgrade preserves backlog, delivery states, rate data, and excludes old writers");
+
+  for (const tied of [false, true]) for (const reverse of [false, true]) {
+    const [orderedA, orderedB] = await make();
+    const input = tied ? [["A", 20000], ["B", 20000], ["C", 20000]] : [["A", 20000], ["B", 25000], ["C", 30000]];
+    for (const [id, duration] of reverse ? [...input].reverse() : input) await orderedA.record(cp(id, duration, 100000, id), config);
+    await Promise.all([orderedB.finalize(config, { nowMs: 190000 }), orderedA.finalize(config, { nowMs: 190000 })]);
+    const ordered = await orderedA.snapshot();
+    assert(ordered.batches.length === 1 && ordered.batches[0].channel.id === "C" &&
+      ordered.batches[0].duration === (tied ? 60 : 75), "deadline/key ordering is independent of insertion order and invoking connection");
+    const after = JSON.stringify(ordered);
+    await orderedB.finalize(config, { nowMs: 500000 });
+    assert(JSON.stringify(await orderedA.snapshot()) === after, "repeated closures cannot reassign consumed carry");
+  }
+  for (const resumedChannel of ["A", "B"]) {
+    const [resumed] = await make();
+    await resumed.record(cp("resume-A", 20000, 100000, "A"), config);
+    await resumed.record(cp("resume-B", 45000, 110000, "B"), config);
+    await resumed.record({ ...cp(`resume-${resumedChannel}`, resumedChannel === "A" ? 25000 : 50000,
+      resumedChannel === "A" ? 100000 : 110000, resumedChannel), intervalStartMs: 220000, lastEligibleAtMs: 225000 }, config);
+    const after = await resumed.snapshot();
+    assert(after.batches.length === 1 && after.batches[0].channel.id === "B" && after.batches[0].duration === 65 &&
+      after.pendingChannels[0].durationMs === 5000 && after.pendingChannels[0].firstPlayMs === 220000,
+      "resumed checkpoint closes every due channel in order before applying fresh credit");
+  }
+  const [active] = await make();
+  await active.record(cp("old-carry", 20000), config);
+  await active.finalize(config, { nowMs: 180000 });
+  await active.record(cp("receiving", 45000, 200000, "B"), config);
+  await active.record(cp("still-active", 30000, 250000, "C"), config);
+  await active.finalize(config, { nowMs: 305000 });
+  const activeSnapshot = await active.snapshot();
+  assert(activeSnapshot.batches[0].duration === 65 && activeSnapshot.batches[0].channel.id === "B" &&
+    activeSnapshot.pendingChannels[0].durationMs === 30000 && activeSnapshot.pendingChannels[0].channel.id === "C",
+    "active short donor remains available even while another channel claims carry");
+  results.push("deterministic closure ordering, concurrent finalization, resumed prefixes, and active-donor exclusion");
+
+  const seedCarry = async (kind) => {
+    const [ledger, peer] = await make();
+    await ledger.record(cp("history", 60000, 100000, "History"), config);
+    await ledger.finalize(config, { nowMs: 160000, force: true });
+    await ledger.record(cp("donor", 20000, 200000, "A"), config);
+    if (kind !== "park") {
+      await ledger.finalize(config, { nowMs: 230000, force: true });
+      await ledger.record(cp("receiver", kind === "auto" ? 45000 : 25000, 300000, "B"), config);
+      if (kind !== "auto") {
+        await ledger.record(cp("shorter", 10000, 300000, "C"), config);
+        await ledger.record(cp("named", 70000, 300000, "Named"), config);
+      }
+    }
+    const action = () => kind === "park" || kind === "auto" ? ledger.finalize(config, { nowMs: 400000, force: true })
+      : kind === "manual" ? ledger.mergeOther(config, { nowMs: 400000 })
+      : kind === "discard" ? ledger.discardOther(config) : ledger.discardAll();
+    return { ledger, peer, action };
+  };
+  const instrumentWrites = (ledger, failAt) => {
+    const original = ledger.transaction.bind(ledger);
+    let writes = 0;
+    ledger.transaction = (mode, operation, readStores) => original(mode, (state, stores) => {
+      const wrapped = Object.fromEntries(Object.entries(stores).map(([name, store]) => [name, new Proxy(store, {
+        get(target, key) {
+          const value = Reflect.get(target, key, target);
+          if (typeof value !== "function") return value;
+          return (...args) => {
+            const result = value.apply(target, args);
+            if (["put", "add", "delete"].includes(key) && ++writes === failAt) throw new Error("Injected carry write failure");
+            return result;
+          };
+        },
+      })]));
+      return operation(state, wrapped);
+    }, readStores);
+    return { count: () => writes, restore: () => { ledger.transaction = original; } };
+  };
+  for (const kind of ["park", "auto", "manual", "discard", "bulk"]) {
+    const sample = await seedCarry(kind);
+    const counter = instrumentWrites(sample.ledger, 0);
+    await sample.action(); counter.restore();
+    assert(counter.count() > 0, `${kind} exercises persistent mutations`);
+    for (let failAt = 1; failAt <= counter.count(); failAt++) {
+      const fixture = await seedCarry(kind);
+      const before = JSON.stringify(await fixture.peer.snapshot());
+      const injected = instrumentWrites(fixture.ledger, failAt);
+      let rejected = false;
+      try { await fixture.action(); } catch (error) { rejected = error.message === "Injected carry write failure"; }
+      finally { injected.restore(); }
+      assert(rejected && JSON.stringify(await fixture.peer.snapshot()) === before,
+        `${kind} failure after write ${failAt} rolls back sources, carry, batches and metadata together`);
+    }
+  }
+  results.push("native transaction rollback at every carry, allocation, manual merge and discard write boundary");
+
+  for (const competing of ["merge", "sync", "discard", "bulk"]) for (const reversed of [false, true]) {
+    const [raceA, raceB] = await make();
+    await raceA.record(cp("race-a", 20000, 100000, "A"), config);
+    await raceA.record(cp("race-b", 25000, 100000, "B"), config);
+    const merge = () => raceA.mergeOther(config, { nowMs: 200000 });
+    const rival = () => competing === "merge" ? raceB.mergeOther(config, { nowMs: 200000 })
+      : competing === "sync" ? raceB.finalize(config, { nowMs: 200000, force: true })
+      : competing === "discard" ? raceB.discardOther(config) : raceB.discardAll();
+    await Promise.all((reversed ? [rival, merge] : [merge, rival]).map(action => action()));
+    const raced = await raceB.snapshot();
+    const discardedFirst = reversed && ["discard", "bulk"].includes(competing);
+    assert(raced.batches.length === (discardedFirst ? 0 : 1) && raced.carry.durationMs === 0 && raced.pendingChannels.length === 0,
+      `concurrent manual merge and ${competing} have one owner for every source range`);
+    if (raced.batches.length) assert(raced.batches[0].duration === 45 &&
+      raced.batches[0].status === (competing === "bulk" ? "dismissed" : "pending"), "race preserves exact duration and discard scope");
+  }
+  const { ledger: invalidCarry } = await seedCarry("manual");
+  const unchanged = JSON.stringify(await invalidCarry.snapshot());
+  for (const invalid of [{ togglWorkspaceId: 0 }, { mergedEntryDescription: null }, { dayBoundary: "bad" }]) {
+    await invalidCarry.finalize({ ...config, ...invalid }, { nowMs: 500000, force: true });
+    await invalidCarry.mergeOther({ ...config, ...invalid }, { nowMs: 500000 });
+    assert(JSON.stringify(await invalidCarry.snapshot()) === unchanged, "invalid allocation settings cannot consume or rearrange carry");
+  }
+  const beforeRollbackCarry = JSON.stringify((await invalidCarry.snapshot()).carry);
+  await invalidCarry.observeClock(() => 500000); await invalidCarry.observeClock(() => 400000);
+  assert(JSON.stringify((await invalidCarry.snapshot()).carry) === beforeRollbackCarry, "clock rollback leaves parked source timestamps and duration unchanged");
+  await invalidCarry.discardOther({ ...config, togglWorkspaceId: 0 });
+  assert((await invalidCarry.snapshot()).carry.durationMs === 0 && (await invalidCarry.snapshot()).pendingChannels[0].channel.id === "Named",
+    "Other discard works without setup and preserves independently qualifying channels");
+  await manual.claim(config, 400000);
+  await manual.complete(merged.id, { type: "timeout" }, 400001);
+  await manual.retry(merged.id);
+  const retried = await manual.claim({ ...config, togglWorkspaceId: 999, mergedEntryDescription: "Changed" }, 86400000);
+  const retriedRequest = API.buildTogglRequest(retried.batch, config);
+  assert(retriedRequest.body.description === "" && retriedRequest.body.start === new Date(300000).toISOString() &&
+    retriedRequest.body.duration === 35 && retriedRequest.body.workspace_id === 123,
+    "retry on a later day preserves empty description, merge date, exact duration and destination");
+  results.push("cross-connection merge/sync/discard races, invalid settings, carry clock rollback, frozen unnamed retry");
+  const [mergeDates] = await make();
+  const previousNight = new Date(2026, 8, 17, 22).getTime();
+  const receiverAt = new Date(2026, 8, 18, 1).getTime();
+  const mergeAt = new Date(2026, 8, 18, 2).getTime();
+  const mergeDateConfig = { ...config, dayBoundary: "04:00" };
+  await mergeDates.record(cp("dated-donor", 20000, previousNight, "A"), mergeDateConfig);
+  await mergeDates.finalize(mergeDateConfig, { nowMs: previousNight + 80000 });
+  await mergeDates.record(cp("dated-receiver", 45000, receiverAt, "B"), mergeDateConfig);
+  await mergeDates.finalize(mergeDateConfig, { nowMs: mergeAt });
+  const datedBatch = (await mergeDates.snapshot()).batches[0];
+  assert(datedBatch.start === new Date(mergeAt).toISOString() && datedBatch.merged && datedBatch.description === "B" &&
+    datedBatch.sources[0].startMs === previousNight, "automatic carry uses today's merge time even before the configured day cutoff, while preserving source dates");
+  results.push("automatic merged date bypasses day cutoff and retains original source timestamps");
   const [a, b] = await make();
   await Promise.all([a.record(cp("one", 30000), config), b.record(cp("two", 35000), config)]);
   await a.record(cp("one", 30000), config);
@@ -44,13 +263,16 @@ globalThis.runLedgerCases = async function runLedgerCases(API) {
   await short.finalize(config, { force: true, nowMs: 150000 });
   await short.record(cp("s2", 45000, 300000, "B"), config);
   await short.finalize(config, { force: true, nowMs: 350000 });
-  assert((await short.snapshot()).batches.length === 0, "short time cannot cross channels");
+  assert((await short.snapshot()).batches[0].duration === 65 && (await short.snapshot()).batches[0].channel.id === "B",
+    "closed short time crosses channels into the next closing receiver");
   await short.record(cp("s3", 40000, 400000), config);
   await short.finalize(config, { force: true, nowMs: 450000 });
-  assert((await short.snapshot()).batches[0].duration === 60, "short time merges for same channel");
+  assert((await short.snapshot()).carry.durationMs === 40000, "later short closure creates a fresh global carry");
+  await short.record(cp("discard-short", 10000, 500000, "D"), { ...config, mergeBelowMinimum: false });
   await short.finalize({ ...config, mergeBelowMinimum: false }, { force: true, nowMs: 450000 });
-  assert((await short.snapshot()).pendingChannels.length === 0, "discard consumes short credit");
-  results.push("short retention stays within channel and discard consumes it");
+  assert((await short.snapshot()).pendingChannels.length === 0 && (await short.snapshot()).carry.durationMs === 40000,
+    "discard mode consumes new short credit while retaining previously saved carry");
+  results.push("cross-channel retention and discard mode preserves existing carry");
   const [gap] = await make();
   await gap.record(cp("gap", 60000), config);
   await gap.record({ ...cp("gap", 90000), intervalStartMs: 220000, lastEligibleAtMs: 250000 }, config);

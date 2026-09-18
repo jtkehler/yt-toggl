@@ -96,8 +96,63 @@ globalThis.runBrowserRuntimeCases = async function (API) {
     await app.operation;
     assert((await ledger.snapshot()).records.reduce((sum, record) => sum + record.durationMs, 0) === saved,
       "BFCache restoration cannot credit suspended playback gap");
+    assert(typeof app.mergeOther === "function" && typeof app.discardOther === "function", "actual app exposes manual merge and Other discard");
+    config.minimumDurationMinutes = 1;
+    config.mergedEntryDescription = "";
+    now += 1000; mediaTime += 1;
+    await app.tick();
+    const beforeMergeCount = (await ledger.snapshot()).batches.length;
+    await app.mergeOther(); await app.operation;
+    snap = await ledger.snapshot();
+    const manualBatch = snap.batches.find(entry => entry.merged);
+    assert(snap.batches.length === beforeMergeCount + 1 && manualBatch.duration === 2 && manualBatch.description === "" &&
+      manualBatch.start === new Date(now).toISOString(), "actual manual action flushes current short time into an unnamed today-dated batch");
+    now += 1000; mediaTime += 1; await app.tick();
+    snap = await ledger.snapshot();
+    assert(snap.pendingChannels[0].durationMs === 1000 && JSON.stringify(snap.batches.find(entry => entry.id === manualBatch.id)) === JSON.stringify(manualBatch),
+      "continued playback remains separate from the frozen manual merge");
+    window.confirm = () => false;
+    const beforeOtherDiscard = JSON.stringify(snap);
+    await app.discardOther();
+    assert(JSON.stringify(await ledger.snapshot()) === beforeOtherDiscard, "canceling Other discard preserves saved time");
+    window.confirm = () => true; await app.discardOther();
+    assert((await ledger.snapshot()).pendingChannels.length === 0, "confirmed Other discard consumes the fresh short prefix");
+    const observer = new BroadcastChannel("yt-toggl-video-ledger-v2");
+    const peer = new API.VideoLedger({ name: ledger.name });
+    const checkpoint = (id, durationMs, channelId = "Window") => ({ id, videoId: id, title: id,
+      channel: { id: channelId, name: channelId }, durationMs, firstPlayMs: now - durationMs,
+      intervalStartMs: now - durationMs, lastEligibleAtMs: now });
+    try {
+      await peer.record(checkpoint("before-window", 20000), config);
+      let observedFlush;
+      const flushed = new Promise(resolve => { observedFlush = resolve; });
+      observer.addEventListener("message", event => {
+        if (event.data.type === "sync") peer.record(checkpoint("during-window", 50000), config)
+          .then(() => observedFlush(), error => observedFlush(error));
+      }, { once: true });
+      const countBeforeWindow = (await ledger.snapshot()).batches.length;
+      await app.mergeOther();
+      const flushError = await flushed;
+      if (flushError) throw flushError;
+      snap = await ledger.snapshot();
+      assert(snap.batches.length === countBeforeWindow && snap.pendingChannels.some(group => group.channel.id === "Window" && group.durationMs === 70000),
+        "observer checkpoints within the flush window can move a channel out of manual Other membership");
+      await peer.record(checkpoint("bounded-short", 10000, "Bounded"), config);
+      await app.mergeOther();
+      const boundedSnapshot = await ledger.snapshot();
+      const boundedBatch = boundedSnapshot.batches.find(entry => entry.sources.some(source => source.recordId === "bounded-short"));
+      assert(boundedBatch?.duration === 10, "manual merge completes without requiring every observer to respond");
+      await peer.record({ ...checkpoint("bounded-short", 15000, "Bounded"),
+        firstPlayMs: now - 10000, intervalStartMs: now, lastEligibleAtMs: now + 5000 }, config);
+      const late = await ledger.snapshot();
+      assert(late.pendingChannels.some(group => group.channel.id === "Bounded" && group.durationMs === 5000) &&
+        JSON.stringify(late.batches.find(entry => entry.id === boundedBatch.id)) === JSON.stringify(boundedBatch),
+        "a checkpoint arriving after manual merge stays separate and cannot alter the frozen batch");
+    } finally { observer.close(); peer.db?.close(); }
     return ["actual startup without upload API, capture, queued checkpoints, global Sync, BFCache baseline",
-      "discard cancellation, individual channel and queued entry scope, bulk discard, continued playback"];
+      "discard cancellation, individual channel and queued entry scope, bulk discard, continued playback",
+      "manual unnamed merge, frozen payload, new playback and Other discard cancellation",
+      "native observer flush window, dynamic Other membership, bounded and late checkpoints"];
   } finally {
     app.stopped = true;
     for (const interval of app.intervals) clearInterval(interval);
