@@ -30,7 +30,7 @@ const CONFIG = {
   minimumDurationMinutes: 1, // Minimum playback minutes including available carry; 0 disables the minimum.
   mergeBelowMinimum: true,   // true carries short time into the next closing channel; false discards new short time.
   mergedEntryDescription: "YouTube — merged", // Manual Merge & Sync description; "" creates an unnamed entry.
-  dayBoundary: null,         // Local "HH:MM" cutoff (e.g. "04:00") for ordinary entries; merged entries use today's date.
+  dayBoundary: null,         // Local "HH:MM" cutoff (e.g. "04:00") for every entry; earlier starts use the previous day at 23:59.
   maxRequestsPerHour: 30,    // Positive integer cap on delivery attempts per rolling hour, shared across tabs.
 };
 
@@ -294,20 +294,6 @@ function makeDescription(channel) {
     return errors;
   }
 
-  function configFingerprint(config = CONFIG) {
-    const input = [
-      normalizedText(config.togglApiToken),
-      String(config.togglWorkspaceId),
-      String(config.togglProjectId),
-    ].join("\u0000");
-    let hash = 0x811c9dc5;
-    for (let index = 0; index < input.length; index += 1) {
-      hash ^= input.charCodeAt(index);
-      hash = Math.imul(hash, 0x01000193);
-    }
-    return (hash >>> 0).toString(16).padStart(8, "0");
-  }
-
   function buildTogglRequest(entry, config = CONFIG) {
     const body = {
       workspace_id: Number(entry.workspaceId),
@@ -442,20 +428,12 @@ function makeDescription(channel) {
 
   function rollingAttemptWindow(attempts, nowMs, maximum) {
     const recent = (Array.isArray(attempts) ? attempts : [])
-      .map((value) => finiteNumber(value))
-      .filter((value) => value > nowMs - ONE_HOUR_MS)
+      .filter((value) => Number.isFinite(value) && value > nowMs - ONE_HOUR_MS)
       .sort((a, b) => a - b);
     const limit = Math.max(1, Math.floor(finiteNumber(maximum, 30)));
-    return {
-      attempts: recent,
-      allowed: recent.length < limit,
-      retryAtMs: recent.length < limit ? nowMs : recent[0] + ONE_HOUR_MS,
-    };
-  }
-
-  function requestSpacingDelay(lastRequestAtMs, nowMs) {
-    const elapsedMs = Math.max(0, nowMs - nonNegativeNumber(lastRequestAtMs));
-    return Math.max(0, REQUEST_SPACING_MS - elapsedMs);
+    const allowed = recent.length < limit;
+    // Past a lowered cap, enough of the oldest attempts must expire first.
+    return { attempts: recent, allowed, retryAtMs: allowed ? nowMs : recent[recent.length - limit] + ONE_HOUR_MS };
   }
 
   function closestTrackablePlayer(video) {
@@ -528,19 +506,6 @@ function makeDescription(channel) {
       }
     }
     return {};
-  }
-
-  function textFrom(root, selectors) {
-    for (const selector of selectors) {
-      try {
-        const element = root && root.querySelector ? root.querySelector(selector) : null;
-        const text = normalizedText(element && (element.textContent || element.getAttribute("aria-label")));
-        if (text) return text;
-      } catch (_error) {
-        // Continue through fallbacks when YouTube is replacing a subtree.
-      }
-    }
-    return "";
   }
 
   function currentInitialPlayerResponse(videoId) {
@@ -674,7 +639,7 @@ function makeDescription(channel) {
   }
 
   function encodeBasicAuth(token) {
-    const input = `${token}:api_token`;
+    const input = `${normalizedText(token)}:api_token`;
     const bytes = new TextEncoder().encode(input);
     let binary = "";
     for (const byte of bytes) binary += String.fromCharCode(byte);
@@ -834,7 +799,7 @@ function makeDescription(channel) {
       const durationMs = sources.reduce((sum, source) => sum + source.durationMs, 0);
       const batch = { id: randomId("batch"), channel: clone(channel), merged,
         description: description === undefined ? makeDescription(clone(channel)) : description,
-        start: merged ? new Date(nowMs).toISOString() : togglStartTime(Math.min(...sources.map(source => source.startMs)), dayBoundaryMinutes(config)),
+        start: togglStartTime(merged ? nowMs : Math.min(...sources.map(source => source.startMs)), dayBoundaryMinutes(config)),
         duration: Math.round(durationMs / 1000), durationMs, workspaceId: Number(config.togglWorkspaceId),
         projectId: config.togglProjectId === null ? null : Number(config.togglProjectId),
         sources, createdAtMs: nowMs, status: "pending", nextAttemptAtMs: 0, message: "" };
@@ -847,7 +812,6 @@ function makeDescription(channel) {
       const carried = config.mergeBelowMinimum ? carry.sources : [];
       const sources = [...carried, ...this.sources(group.pending)];
       const short = belowMinimum(sources.reduce((sum, source) => sum + source.durationMs, 0), config);
-      if ((config.mergeBelowMinimum || !short) && !allocationConfigured(config)) return null;
       this.consume(group.pending, stores);
       if (short) {
         if (config.mergeBelowMinimum) this.writeCarry(carry, sources, stores);
@@ -859,7 +823,8 @@ function makeDescription(channel) {
     }
 
     closeGroups(state, stores, config, cutoffMs, nowMs, force = false) {
-      if (config.mergeBelowMinimum && !allocationConfigured(config)) return [];
+      // Invalid allocation settings suspend the whole pass in either mode; credit waits for a fix.
+      if (!allocationConfigured(config)) return [];
       const key = group => group.channel.id ? `id:${group.channel.id}` : `name:${group.channel.name.toLowerCase()}`;
       const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
       const groups = this.groups(state.records).filter(group => force || group.lastEligibleAtMs + inactivityMs(config) <= cutoffMs)
@@ -1084,13 +1049,12 @@ function makeDescription(channel) {
         const worker = state.meta.find((item) => item.id === "worker") || { id: "worker", attempts: [], quotaUntilMs: 0, lastCompletedAtMs: null };
         if (worker.authBlocked) return { blocked: true };
         // Future attempts stay counted when the wall clock moves backwards.
-        worker.attempts = worker.attempts.filter((time) => Number.isFinite(time) && time > nowMs - ONE_HOUR_MS).sort((a, b) => a - b);
+        const attemptWindow = rollingAttemptWindow(worker.attempts, nowMs, config.maxRequestsPerHour);
+        worker.attempts = attemptWindow.attempts;
         const pending = state.batches.filter((batch) => batch.status === "pending").sort((a, b) => a.createdAtMs - b.createdAtMs || a.id.localeCompare(b.id));
         if (!pending.length) return {};
-        const limit = Math.max(1, Math.floor(finiteNumber(config.maxRequestsPerHour, 30)));
-        let waitUntilMs = Math.max(worker.quotaUntilMs || 0,
+        let waitUntilMs = Math.max(worker.quotaUntilMs || 0, attemptWindow.retryAtMs,
           worker.lastCompletedAtMs === null ? 0 : worker.lastCompletedAtMs + REQUEST_SPACING_MS);
-        if (worker.attempts.length >= limit) waitUntilMs = Math.max(waitUntilMs, worker.attempts[worker.attempts.length - limit] + ONE_HOUR_MS);
         const batch = pending.find((item) => (item.nextAttemptAtMs || 0) <= nowMs);
         if (!batch) waitUntilMs = Math.max(waitUntilMs, Math.min(...pending.map((item) => item.nextAttemptAtMs)));
         if (waitUntilMs > nowMs || !batch) return { waitUntilMs };
@@ -1164,9 +1128,9 @@ function makeDescription(channel) {
         this.capabilityError = "Toggl delivery needs Violentmonkey GM_xmlhttpRequest permission. Reinstall or enable the userscript; playback remains stored locally.";
         return;
       }
-      const configErrors = validateConfig(this.config);
-      if (configErrors.length) { this.capabilityError = configErrors.join(" "); return; }
       this.capabilityError = "";
+      // The panel lists validateConfig errors itself; delivery just waits for valid settings.
+      if (validateConfig(this.config).length) return;
       return this.locks.request(`${SCRIPT_ID}:video-ledger-delivery:v2`, async () => {
         await this.ledger.recoverSending();
         while (true) {
@@ -1287,21 +1251,8 @@ function makeDescription(channel) {
     #readout { margin: 9px 0 3px; font: 30px/1 var(--mono); letter-spacing: -0.01em;
       font-variant-numeric: tabular-nums; }
     #channel { margin: 0; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
-    #threshold-group[hidden] { display: none; }
-    #threshold { height: 2px; margin: 14px 0 8px; border-radius: 2px;
-      background: var(--line); overflow: hidden; }
-    #threshold-fill { display: block; width: 0%; height: 100%; background: var(--muted);
-      transition: width 240ms linear; }
-    #threshold[data-state="met"] #threshold-fill { background: var(--accent); }
     #threshold-caption { margin: 0; font: 10px/1 var(--mono); letter-spacing: 0.12em;
       text-transform: uppercase; color: var(--muted); }
-    #threshold[data-state="met"] + #threshold-caption { color: var(--accent); }
-    .rows { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px;
-      margin: 18px 0 0; }
-    .rows dt { font: 10px/1.6 var(--mono); letter-spacing: 0.12em;
-      text-transform: uppercase; color: var(--muted); }
-    .rows dd { margin: 0; text-align: right; font: 12.5px/1.6 var(--mono);
-      font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
     h3 { margin: 17px 0 0; font: 10px/1 var(--mono); letter-spacing: 0.12em;
       text-transform: uppercase; color: var(--muted); }
     button { font: 11px/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase;
@@ -1320,7 +1271,6 @@ function makeDescription(channel) {
     .meta { color: var(--muted); font-size: 12px; }
     @media (prefers-reduced-motion: reduce) {
       #panel { animation: none; }
-      #threshold-fill { transition: none; }
     }
   `;
 
@@ -1533,7 +1483,7 @@ function makeDescription(channel) {
         }, (row, batch) => {
           const title = `${batch.status}: ${batch.description || "(No description)"} · ${formatDuration(batch.duration * 1000)}`;
           if (row.title.textContent !== title) row.title.textContent = title;
-          const detail = `${batch.start} · Workspace ${batch.workspaceId || ""}${batch.projectId ? ` / Project ${batch.projectId}` : ""}${batch.message ? ` · ${batch.message}` : ""}`;
+          const detail = `${new Date(batch.start).toLocaleString()} · Workspace ${batch.workspaceId || ""}${batch.projectId ? ` / Project ${batch.projectId}` : ""}${batch.message ? ` · ${batch.message}` : ""}`;
           if (row.detail.textContent !== detail) row.detail.textContent = detail;
           row.retry.hidden = !["uncertain", "blocked"].includes(batch.status);
           row.dismiss.hidden = batch.status === "sending";
@@ -1704,7 +1654,7 @@ function makeDescription(channel) {
     }
   }
 
-  const API = {CONFIG,BrowserApp,StatusControl,PlaybackRecorder,VideoLedger,TogglWorker,clone,normalizeChannel,channelsEqual,mergeChannel,normalizeSnapshot,validatedPlaybackMs,selectActiveVideo,closestTrackablePlayer,isTopLevelBrowsingContext,discoverMedia,validateConfig,buildTogglRequest,encodeBasicAuth,parseResponseHeaders,classifyAttempt,rollingAttemptWindow,requestSpacingDelay,randomId,minimumDurationMs,inactivityMs};
+  const API = {CONFIG,BrowserApp,StatusControl,PlaybackRecorder,VideoLedger,TogglWorker,clone,normalizeChannel,channelsEqual,mergeChannel,normalizeSnapshot,validatedPlaybackMs,selectActiveVideo,closestTrackablePlayer,isTopLevelBrowsingContext,discoverMedia,validateConfig,buildTogglRequest,encodeBasicAuth,parseResponseHeaders,classifyAttempt,rollingAttemptWindow,randomId,minimumDurationMs,inactivityMs};
   if (typeof module !== "undefined" && module.exports) module.exports = API;
   if (typeof module === "undefined" && typeof window !== "undefined" && typeof document !== "undefined" && isTopLevelBrowsingContext()) {
     new BrowserApp(CONFIG).start();

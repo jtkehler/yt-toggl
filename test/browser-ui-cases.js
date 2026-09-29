@@ -46,7 +46,8 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     assert(shadow.textContent.includes(record.title), "current video title is displayed");
     assert(shadow.getElementById("channels").textContent.includes(channel.name), "global pending channel is displayed");
     const decisions = shadow.getElementById("decisions");
-    assert(decisions.textContent.includes("2026"), "queued decision includes a viewing timestamp");
+    assert(decisions.textContent.includes(new Date(batch.start).toLocaleString()) && !decisions.textContent.includes(batch.start),
+      "queued decision shows its frozen start in local time");
     const findAction = label => Array.from(decisions.querySelectorAll("button")).find(button => button.textContent === label);
     const retry = findAction("Retry");
     const dismiss = findAction("Discard");
@@ -108,6 +109,14 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     assert(summary.dataset.attention === "1" && shadow.textContent.includes("Web Locks"),
       "missing delivery capability surfaces an actionable notice");
     app.worker.capabilityError = "";
+    const validConfig = app.config, fixtureWorker = app.worker;
+    app.config = { ...validConfig, togglApiToken: "" };
+    app.worker = new API.TogglWorker(app.ledger, app.config, { locks: { request: async () => {} }, send: async () => ({}) });
+    await app.worker.kick();
+    status.render();
+    assert(shadow.getElementById("error").textContent.split("Set CONFIG.togglApiToken.").length === 2,
+      "each configuration error is shown once while delivery waits for valid settings");
+    app.config = validConfig; app.worker = fixtureWorker;
     app.ready = false;
     status.render();
     assert(shadow.getElementById("sync").disabled, "Sync waits for ledger readiness");
@@ -116,7 +125,7 @@ globalThis.runBrowserUiCases = async function runBrowserUiCases(API) {
     app.view.batches = [{ ...batch, status: "pending" }];
     status.render();
     assert(findAction("Discard").disabled, "queued entry discard waits for ledger readiness");
-    results.push("validated stalled state, resolved attention, clearable errors, capability and readiness states");
+    results.push("validated stalled state, resolved attention, clearable errors, single configuration notice, capability and readiness states");
     app.ready = true;
     const shortRecord = (id, durationMs) => ({ ...record, id, videoId: id, channel: { id, name: id },
       durationMs, consumedMs: 0, pendingStartMs: start, lastEligibleAtMs: Date.now() });

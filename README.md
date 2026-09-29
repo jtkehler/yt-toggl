@@ -14,14 +14,14 @@ Records are shared across YouTube tabs and windows in the same browser profile. 
 
 | Setting | Meaning |
 | --- | --- |
-| `togglApiToken` | Your Toggl Track API token; authentication uses `<token>:api_token`. |
+| `togglApiToken` | Your Toggl Track API token; authentication uses `<token>:api_token`, ignoring surrounding whitespace. |
 | `togglWorkspaceId` | Required positive integer workspace ID. |
 | `togglProjectId` | Optional positive integer project ID; `null` omits it. |
 | `inactivityMinutes` | Close a channel after this many minutes without validated playback. Must be greater than 0; default: 10. |
 | `minimumDurationMinutes` | Minimum combined duration in minutes, including available carry in merge mode. Default: 1; use 0 to disable. |
 | `mergeBelowMinimum` | `true` carries closed short time into the next closing channel across all tabs; `false` discards newly closed short totals. Previously saved carry remains available for manual merge/discard. |
 | `mergedEntryDescription` | Description for manual **Merge & Sync**. Default: `"YouTube — merged"`; set to `""` for an unnamed entry. Automatic carry uses the receiving channel's description. |
-| `dayBoundary` | Optional local start of day for ordinary, unmerged channel entries, in 24-hour `"HH:MM"` format, e.g. `"04:00"`. Default: `null` (off). Merged entries use their creation date. |
+| `dayBoundary` | Optional local start of day for every entry, in 24-hour `"HH:MM"` format, e.g. `"04:00"`. Default: `null` (off). |
 | `maxRequestsPerHour` | Positive integer cap on request attempts per rolling hour, shared across YouTube tabs. Default: 30. |
 
 Playback can be recorded before credentials are complete. Time stays unbatched until a valid workspace/project destination is configured. An outgoing batch freezes its destination; changing configuration does not retarget existing batches.
@@ -42,9 +42,9 @@ In merge mode, closing a short channel moves its time into a shared carry pool. 
 
 Still-active channels keep their time until they close. Once time enters carry, resumed playback starts a fresh available balance. If no further channel closes, carry remains saved for later playback or manual merge. In discard mode, newly closed short totals are consumed without uploading; carry already saved before disabling merge mode is kept for manual merge or discard. Duration is rounded once after summing milliseconds; a manual merge that rounds to zero seconds leaves its time saved.
 
-An ordinary channel batch starts at its earliest included first-play timestamp and uses the sum of credited durations. A batch that includes carry, or is created by manual **Merge & Sync**, starts at the merge timestamp: **today in the browser's local timezone**, even when some carried time is older. Merged entries bypass `dayBoundary`. This favors recording the accumulated total over exact historical attribution. Gaps and simultaneous playback mean an entry's implied continuous interval may differ from the actual viewing intervals. Original video timestamps, credited durations, and batch membership remain available locally.
+An ordinary channel batch starts at its earliest included first-play timestamp and uses the sum of credited durations. A batch that includes carry, or is created by manual **Merge & Sync**, starts at the merge timestamp, even when some carried time is older. `dayBoundary` applies to both kinds of start. This favors recording the accumulated total over exact historical attribution. Gaps and simultaneous playback mean an entry's implied continuous interval may differ from the actual viewing intervals. Original video timestamps, credited durations, and batch membership remain available locally.
 
-With `dayBoundary: "04:00"`, an ordinary, unmerged batch whose earliest included start is between midnight (inclusive) and 04:00 (exclusive) is sent with a start of **23:59:00 on the previous calendar day**. Starts at or after 04:00 keep their original timestamp. The adjustment uses the browser's local timezone when the batch is created, including daylight-saving changes; match your Toggl report timezone to it for the same date attribution. Only the outgoing start changes: recorded playback timestamps and credited duration stay intact.
+With `dayBoundary: "04:00"`, a batch whose base start (the earliest included start, or the merge timestamp for a merged batch) is between midnight (inclusive) and 04:00 (exclusive) is sent with a start of **23:59:00 on the previous calendar day**. Starts at or after 04:00 keep their original timestamp. The adjustment uses the browser's local timezone when the batch is created, including daylight-saving changes; match your Toggl report timezone to it for the same date attribution. Only the outgoing start changes: recorded playback timestamps and credited duration stay intact. **Delivery** rows show each outgoing start in the browser's local time.
 
 For ordinary batches, the earliest included start governs the entire channel batch, including videos on both sides of the cutoff. A new ordinary batch after Sync uses the start of its newly included playback. Every outgoing start and description is frozen before delivery: a delayed send, changed setting, or retry on another day cannot alter it. Invalid allocation settings show a configuration error and preserve the saved credit until corrected.
 
@@ -60,7 +60,7 @@ The button pulses only while playback has validated progress. An unpaused player
 
 **Sync** asks other live YouTube pages to checkpoint and waits up to 500 ms before closing the globally available channels in deadline order under the combined minimum rule. Carry alone stays saved if no channel closes. Suspended or unresponsive pages cannot hold Sync open; their later contributions belong to another batch. Continued playback contributes to the next batch. Without BroadcastChannel, Sync still uses the already persisted global records.
 
-**Merge & Sync** on Other uses the same checkpoint window, then combines the saved carry and currently below-minimum channel totals into one entry dated today. It bypasses the minimum and inactivity wait. A channel that reaches the minimum during that window becomes a named channel and is excluded from this manual merge. The visible Other total previews the available amount; playback and other tabs can change it before allocation. Set `mergedEntryDescription: ""` to send this entry without a name; the local Delivery row displays **(No description)**.
+**Merge & Sync** on Other uses the same checkpoint window, then combines the saved carry and currently below-minimum channel totals into one entry that starts at the merge timestamp, adjusted by `dayBoundary`. It bypasses the minimum and inactivity wait. A channel that reaches the minimum during that window becomes a named channel and is excluded from this manual merge. The visible Other total previews the available amount; playback and other tabs can change it before allocation. Set `mergedEntryDescription: ""` to send this entry without a name; the local Delivery row displays **(No description)**.
 
 Outgoing batches have fixed source membership and payloads. Recording more videos cannot change a queued, sending, or uncertain batch. Retry and Discard act only on the current permitted state; successful receipts remain recorded locally.
 

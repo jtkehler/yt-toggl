@@ -97,6 +97,14 @@ test("hourly attempts expire at the exact boundary", () => {
   assert.equal(api.rollingAttemptWindow(a, 3600999, 30).allowed, false);
   assert.equal(api.rollingAttemptWindow(a, 3601000, 30).allowed, true);
 });
+test("lowered hourly cap waits for enough attempts to expire", () => {
+  const attempts = [3000, 1000, 2000];
+  const limited = api.rollingAttemptWindow(attempts, 4000, 2);
+  assert.equal(limited.allowed, false);
+  assert.equal(limited.retryAtMs, 3602000);
+  assert.equal(api.rollingAttemptWindow(attempts, 3601999, 2).allowed, false);
+  assert.equal(api.rollingAttemptWindow(attempts, 3602000, 2).allowed, true);
+});
 test("outgoing destination is frozen and optional fields omitted", () => {
   const r = api.buildTogglRequest({ description: "A", duration: 70, start: "2026-09-11T00:00:00Z", workspaceId: 987, projectId: null }, cfg({ togglProjectId: 12 }));
   assert.equal(r.url, "https://api.track.toggl.com/api/v9/workspaces/987/time_entries");
@@ -105,6 +113,7 @@ test("outgoing destination is frozen and optional fields omitted", () => {
 test("project and Basic token authentication follow Toggl API contract", () => {
   assert.equal(api.buildTogglRequest({ description: "A", duration: 1, start: "2026-09-11T00:00:00Z", workspaceId: 123, projectId: 9 }, cfg()).body.project_id, 9);
   assert.equal(api.encodeBasicAuth("fake"), `Basic ${Buffer.from("fake:api_token").toString("base64")}`);
+  assert.equal(api.encodeBasicAuth(" fake\n"), `Basic ${Buffer.from("fake:api_token").toString("base64")}`);
 });
 for (const outcome of [{ type: "timeout" }, { type: "network-error" }, { type: "aborted" }, { type: "response", status: 408 }, { type: "response", status: 500 }]) {
   test(`ambiguous ${outcome.status || outcome.type} requires a decision`, () => assert.equal(api.classifyAttempt(outcome, 10000).status, "uncertain"));

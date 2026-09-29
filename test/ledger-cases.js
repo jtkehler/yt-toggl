@@ -35,15 +35,16 @@ globalThis.runLedgerCases = async function runLedgerCases(API) {
   await manual.finalize(config, { nowMs: 180000 });
   await manual.record(cp("manual-short", 15000, 200000, "B"), config);
   await manual.record(cp("manual-named", 60000, 200000, "C"), config);
-  const merged = await manual.mergeOther({ ...config, mergedEntryDescription: "", dayBoundary: "04:00" }, { nowMs: 300000 });
-  assert(merged.duration === 35 && merged.description === "" && merged.merged && merged.start === new Date(300000).toISOString(),
-    "manual merge bypasses minimum, permits no description, and freezes creation time without day cutoff");
+  const manualMergeAt = new Date(2026, 8, 18, 2).getTime();
+  const merged = await manual.mergeOther({ ...config, mergedEntryDescription: "", dayBoundary: "04:00" }, { nowMs: manualMergeAt });
+  assert(merged.duration === 35 && merged.description === "" && merged.merged && merged.start === new Date(2026, 8, 17, 23, 59).toISOString(),
+    "manual merge bypasses minimum, permits no description, and applies the day cutoff to its merge time");
   let manualSnapshot = await manual.snapshot();
   assert(manualSnapshot.pendingChannels.length === 1 && manualSnapshot.pendingChannels[0].channel.id === "C" &&
     manualSnapshot.carry.durationMs === 0, "manual merge consumes only Other and preserves named channels");
   assert(manualSnapshot.records.find(record => record.id === "manual-short").durationMs === 15000,
     "merging never changes the original video's recorded history");
-  assert(await manual.mergeOther(config, { nowMs: 300001 }) === null, "repeated empty manual merge cannot duplicate time");
+  assert(await manual.mergeOther(config, { nowMs: manualMergeAt + 1 }) === null, "repeated empty manual merge cannot duplicate time");
   const [fraction] = await make();
   await fraction.record(cp("fraction", 400), config);
   assert(await fraction.mergeOther(config, { nowMs: 100400 }) === null, "rounded-zero manual total remains saved");
@@ -203,10 +204,11 @@ globalThis.runLedgerCases = async function runLedgerCases(API) {
   }
   const { ledger: invalidCarry } = await seedCarry("manual");
   const unchanged = JSON.stringify(await invalidCarry.snapshot());
-  for (const invalid of [{ togglWorkspaceId: 0 }, { mergedEntryDescription: null }, { dayBoundary: "bad" }]) {
+  for (const invalid of [{ togglWorkspaceId: 0 }, { mergedEntryDescription: null }, { dayBoundary: "bad" },
+    { mergeBelowMinimum: false, togglWorkspaceId: 0 }, { mergeBelowMinimum: false, inactivityMinutes: 0 }]) {
     await invalidCarry.finalize({ ...config, ...invalid }, { nowMs: 500000, force: true });
     await invalidCarry.mergeOther({ ...config, ...invalid }, { nowMs: 500000 });
-    assert(JSON.stringify(await invalidCarry.snapshot()) === unchanged, "invalid allocation settings cannot consume or rearrange carry");
+    assert(JSON.stringify(await invalidCarry.snapshot()) === unchanged, "invalid allocation settings cannot consume short credit or rearrange carry in either mode");
   }
   const beforeRollbackCarry = JSON.stringify((await invalidCarry.snapshot()).carry);
   await invalidCarry.observeClock(() => 500000); await invalidCarry.observeClock(() => 400000);
@@ -214,12 +216,12 @@ globalThis.runLedgerCases = async function runLedgerCases(API) {
   await invalidCarry.discardOther({ ...config, togglWorkspaceId: 0 });
   assert((await invalidCarry.snapshot()).carry.durationMs === 0 && (await invalidCarry.snapshot()).pendingChannels[0].channel.id === "Named",
     "Other discard works without setup and preserves independently qualifying channels");
-  await manual.claim(config, 400000);
-  await manual.complete(merged.id, { type: "timeout" }, 400001);
+  await manual.claim(config, manualMergeAt + 100000);
+  await manual.complete(merged.id, { type: "timeout" }, manualMergeAt + 100001);
   await manual.retry(merged.id);
-  const retried = await manual.claim({ ...config, togglWorkspaceId: 999, mergedEntryDescription: "Changed" }, 86400000);
+  const retried = await manual.claim({ ...config, togglWorkspaceId: 999, mergedEntryDescription: "Changed" }, manualMergeAt + 86400000);
   const retriedRequest = API.buildTogglRequest(retried.batch, config);
-  assert(retriedRequest.body.description === "" && retriedRequest.body.start === new Date(300000).toISOString() &&
+  assert(retriedRequest.body.description === "" && retriedRequest.body.start === merged.start &&
     retriedRequest.body.duration === 35 && retriedRequest.body.workspace_id === 123,
     "retry on a later day preserves empty description, merge date, exact duration and destination");
   results.push("cross-connection merge/sync/discard races, invalid settings, carry clock rollback, frozen unnamed retry");
@@ -233,9 +235,9 @@ globalThis.runLedgerCases = async function runLedgerCases(API) {
   await mergeDates.record(cp("dated-receiver", 45000, receiverAt, "B"), mergeDateConfig);
   await mergeDates.finalize(mergeDateConfig, { nowMs: mergeAt });
   const datedBatch = (await mergeDates.snapshot()).batches[0];
-  assert(datedBatch.start === new Date(mergeAt).toISOString() && datedBatch.merged && datedBatch.description === "B" &&
-    datedBatch.sources[0].startMs === previousNight, "automatic carry uses today's merge time even before the configured day cutoff, while preserving source dates");
-  results.push("automatic merged date bypasses day cutoff and retains original source timestamps");
+  assert(datedBatch.start === new Date(2026, 8, 17, 23, 59).toISOString() && datedBatch.merged && datedBatch.description === "B" &&
+    datedBatch.sources[0].startMs === previousNight, "automatic carry applies the day cutoff to its merge time while preserving source dates");
+  results.push("automatic merged date applies day cutoff and retains original source timestamps");
   const [a, b] = await make();
   await Promise.all([a.record(cp("one", 30000), config), b.record(cp("two", 35000), config)]);
   await a.record(cp("one", 30000), config);
